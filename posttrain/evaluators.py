@@ -28,6 +28,7 @@ class AgenticEvaluator(SamplingClientEvaluator):
     temperature: float = 0.6
     concurrency: int = 16
     prefix: str = "agentic"
+    harness: str = "ours"  # "vals" = the competition harness's tools/prompt (cpp_executor, submission)
     _tasks: list = field(default_factory=list, repr=False)
 
     async def __call__(self, sampling_client) -> dict[str, float]:
@@ -44,7 +45,7 @@ class AgenticEvaluator(SamplingClientEvaluator):
         renderer = renderers.get_renderer(self.renderer_name, get_tokenizer(self.model_name), model_name=self.model_name)
         policy = TinkerTokenCompleter(sampling_client, max_tokens=self.max_tokens, temperature=self.temperature,
                                       context_window=self.context_window)
-        settings = EnvSettings(max_turns=self.max_turns, context_window=self.context_window)
+        settings = EnvSettings(max_turns=self.max_turns, context_window=self.context_window, harness=self.harness)
         pool = make_ondemand_pool(32)
         sem = asyncio.Semaphore(self.concurrency)
 
@@ -55,7 +56,7 @@ class AgenticEvaluator(SamplingClientEvaluator):
                     traj = await do_single_rollout(policy, env)
                     s = await tools.final_score()
                     turns = sum(m["role"] == "assistant" for m in env.message_env.history)
-                    return {"score": s.score, "turns": turns, "no_sub": float(tools.last_compiling is None),
+                    return {"score": s.score, "score_proportional": s.score_proportional, "turns": turns, "no_sub": float(tools.last_compiling is None),
                             "turn_cap": float(traj.stop_reason == "max_turns")}
                 except Exception:
                     return None
@@ -66,6 +67,7 @@ class AgenticEvaluator(SamplingClientEvaluator):
         n = len(res)
         return {
             f"{self.prefix}/mean_score": sum(r["score"] for r in res) / n,
+            f"{self.prefix}/mean_score_proportional": sum(r["score_proportional"] for r in res) / n,
             f"{self.prefix}/full_100": sum(r["score"] == 100 for r in res) / n,
             f"{self.prefix}/mean_turns": sum(r["turns"] for r in res) / n,
             f"{self.prefix}/no_submission": sum(r["no_sub"] for r in res) / n,

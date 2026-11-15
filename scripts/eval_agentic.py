@@ -10,6 +10,9 @@ submission graded on hidden tests (small 40 / large 60), C++20.
     # a checkpoint
     uv run python scripts/eval_agentic.py --model Qwen/Qwen3-8B --model-path tinker://.../sampler_weights/x --limit 50 --name agent-ckpt
 
+    # the competition harness's tools/prompt (cpp_executor, submission); compare by mean_score_proportional
+    uv run python scripts/eval_agentic.py --model Qwen/Qwen3.5-9B --harness vals --limit 50 --name agent-vals
+
     # summary / one transcript
     uv run python scripts/eval_agentic.py --summarize runs/evals/agent-qwen3-8b
     uv run python scripts/eval_agentic.py --show runs/evals/agent-qwen3-8b abc365_e
@@ -116,7 +119,8 @@ def show(out_dir: Path, qid: str) -> None:
         if r["question_id"] != qid:
             continue
         print(f"### {qid} sample {r['sample']}: score {r['score']} (best {r['best_score']}), stop={r['stop_reason']}, turns={r['turns']}")
-        for m in r["transcript"][2:]:  # skip system + problem
+        start = next((i for i, m in enumerate(r["transcript"]) if m["role"] == "assistant"), 0)
+        for m in r["transcript"][start:]:  # skip system/problem prompt
             if m.get("thinking"):
                 print(f"\n[{m['role']} thinking, {len(m['thinking'])} chars] ...{m['thinking'][-400:]!r}")
             if m.get("content"):
@@ -148,6 +152,7 @@ async def run(args) -> Path | None:
     cfg_path = out_dir / "config.json"
     if cfg_path.exists():
         old = json.loads(cfg_path.read_text())
+        old.setdefault("harness", "ours")  # runs from before --harness existed
         diff = {k: (old.get(k), v) for k, v in cfg.items() if old.get(k) != v and k not in MAY_CHANGE_ON_RESUME}
         if diff:
             raise SystemExit(f"{cfg_path} exists with different settings {diff}. Use a new --name.")
@@ -176,8 +181,8 @@ async def run(args) -> Path | None:
     policy = TinkerTokenCompleter(client, max_tokens=args.max_tokens, temperature=args.temperature,
                                   context_window=context_window)
     settings = EnvSettings(max_turns=args.max_turns, context_window=context_window,
-                           max_consecutive_parse_errors=args.max_parse_errors)
-    print(f"renderer={renderer_name} context_window={context_window} max_tokens/turn={args.max_tokens} max_turns={args.max_turns}")
+                           max_consecutive_parse_errors=args.max_parse_errors, harness=args.harness)
+    print(f"harness={args.harness} renderer={renderer_name} context_window={context_window} max_tokens/turn={args.max_tokens} max_turns={args.max_turns}")
 
     pool = make_ondemand_pool(max_concurrent=args.pool)
     sem = asyncio.Semaphore(args.concurrency)
@@ -257,6 +262,8 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.6)
     ap.add_argument("--concurrency", type=int, default=16)
     ap.add_argument("--pool", type=int, default=32)
+    ap.add_argument("--harness", choices=["ours", "vals"], default="ours",
+                    help="vals = the competition harness's tools/prompt (cpp_executor, submission)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 

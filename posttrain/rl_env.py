@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import re
 import time
 from collections import Counter
 from collections.abc import Sequence
@@ -72,6 +73,7 @@ class RewardSettings:
     max_trivial: float = 0.5         # no bonus from a group whose constant-answer baseline is above this
     require_samples: bool = True     # score counts only if the graded submission passes every statement example
     post_submit_penalty: float = 0.0 # per wasted turn after the final graded submission (score > 0 only)
+    metric: str = "groups"           # "groups": 40/60 all-or-nothing; "proportional": per-test partial credit (vals grading)
 
 
 _POOL = None
@@ -106,7 +108,7 @@ def _is_exit_text(env) -> bool:
         return False
     c = last.get("content")
     text = c if isinstance(c, str) else "".join(p.get("text", "") for p in (c or []) if p.get("type") == "text")
-    return text.strip().endswith("EXIT")
+    return bool(re.search(r"\bEXIT\b", text, re.IGNORECASE))  # as the vals harness detects it
 
 
 def _text(m) -> str:
@@ -118,18 +120,25 @@ def turns_after_final_submission(env, tools) -> int | None:
     """Assistant turns after the one whose submit call produced the graded (last compiling)
     submission; None if there is none. Located by that submit's own tool result ("Submission n/..."),
     so tool calls that failed validation (and never reached the tool) don't throw the count off."""
-    sub = tools.last_compiling
-    if sub is None:
+    if tools.last_compiling is None:
         return None
-    n = max(i for i, s in enumerate(tools.submissions) if s is sub) + 1
-    marker = f"Submission {n}/"
     turn, final_turn = 0, None
     for m in env.message_env.history:
         if m["role"] == "assistant":
             turn += 1
-        elif m["role"] == "tool" and m.get("name") == "submit" and _text(m).startswith(marker):
-            final_turn = turn
+        elif m["role"] == "tool" and _compiled_submit_result(m):
+            final_turn = turn  # the last compiled submission's result is the graded one
     return None if final_turn is None else turn - final_turn
+
+
+def _compiled_submit_result(m) -> bool:
+    """Tool result of a submission that compiled, in either harness's format."""
+    t = _text(m)
+    if m.get("name") == "submit":        # ours: "Submission n/50 compiled. ..."
+        return " compiled." in t.split("\n", 1)[0]
+    if m.get("name") == "submission":    # vals: {"saved": true, "samples": ..., ...}
+        return t.startswith('{"saved": true')
+    return False
 
 
 def rollout_stats(traj: Trajectory) -> dict:
@@ -179,7 +188,7 @@ class CompetitionGroupBuilder(EnvGroupBuilder):
         for k, (traj, env, final) in enumerate(zip(trajectory_group, env_group, finals)):
             tools = env.competition_tools
             st = rollout_stats(traj)
-            score = float(final.score)
+            score = float(final.score_proportional if self.reward.metric == "proportional" else final.score)
             sub = tools.last_compiling
             samples_ok = bool(sub and sub.sample_verdicts and all(v == "accepted" for v in sub.sample_verdicts))
             bonus = partial_credit(final, self.reward.max_trivial) if samples_ok else 0.0
@@ -194,6 +203,7 @@ class CompetitionGroupBuilder(EnvGroupBuilder):
             m = {
                 "rl/score": score,
                 "rl/score_proportional": float(final.score_proportional),
+                "rl/score_groups": float(final.score),
                 "rl/full_100": float(score == 100),
                 "rl/no_compiling_submission": float(tools.last_compiling is None),
                 "rl/submissions": float(len(tools.submissions)),
@@ -217,6 +227,7 @@ class CompetitionGroupBuilder(EnvGroupBuilder):
             records.append({
                 "batch": self.batch, "problem_id": self.problem["id"], "rating": self.problem.get("rating"),
                 "rollout": k, "reward": round(r, 4), "reward_base": round(base, 4), "score": score, "score_counted": counted,
+                "score_groups": float(final.score),
                 "score_proportional": float(final.score_proportional), "bonus": round(bonus, 4),
                 "samples_ok": samples_ok, "trivial_small": final.trivial_small, "trivial_large": final.trivial_large,
                 "exit": exit_text, "turns_after_final_submit": after, "wasted_turns": wasted,
@@ -302,6 +313,8 @@ class CompetitionDatasetBuilder(RLDatasetBuilder):
     max_trivial: float = 0.5
     require_samples: bool = True
     post_submit_penalty: float = 0.0
+    reward_metric: str = "groups"
+    harness: str = "ours"
     history: tuple[str, ...] = ()        # rollouts.jsonl files of earlier runs: skip problems that taught nothing
     history_skip: tuple[str, ...] = ("too_easy", "too_hard")  # which history classes to skip
     hard_group_size: int | None = None   # larger groups for hard problems (more chance one rollout succeeds)
@@ -329,6 +342,7 @@ class CompetitionDatasetBuilder(RLDatasetBuilder):
             max_generation_tokens=self.max_tokens_per_turn,
             max_consecutive_parse_errors=self.max_consecutive_parse_errors,
             parse_error_penalty=0.0,  # the malformed penalty is applied in compute_group_rewards
+            harness=self.harness,
         )
         if self.history:
             classes = self.problem_classes()
@@ -337,7 +351,7 @@ class CompetitionDatasetBuilder(RLDatasetBuilder):
         reward = RewardSettings(turn_penalty=self.turn_penalty, malformed_penalty=self.malformed_penalty,
                                 partial_credit=self.partial_credit, max_trivial=self.max_trivial,
                                 require_samples=self.require_samples,
-                                post_submit_penalty=self.post_submit_penalty)
+                                post_submit_penalty=self.post_submit_penalty, metric=self.reward_metric)
 
         def make_builder(p: dict, batch: int) -> CompetitionGroupBuilder:
             return CompetitionGroupBuilder(problem=p, model_name=self.model_name, renderer_name=self.renderer_name,

@@ -135,3 +135,86 @@ class CompetitionTools:
             "run_calls": self.n_run_calls,
             "infra_errors": self.n_infra_errors,
         }
+
+
+# ---------------------------------------------------------------- the competition harness's tools
+# Same names, parameters, descriptions and output formats as github.com/vals-ai/hackathon-post-training-agent
+# (src/post_training_agent/tools.py), so RL trains the tool-call habits the graded runs actually see.
+# Grading state (submissions, last_compiling, final_score) is inherited from CompetitionTools.
+
+import json as _json  # noqa: E402
+
+VALS_OUTPUT_LIMIT = 4000
+
+
+def _vals_clip(text: str) -> str:
+    return text if len(text) <= VALS_OUTPUT_LIMIT else text[:VALS_OUTPUT_LIMIT] + f"\n... [{len(text) - VALS_OUTPUT_LIMIT} more chars]"
+
+
+def _vals_extract(code: str) -> str:
+    lines = code.split("\n")
+    marks = [i for i, ln in enumerate(lines) if "```" in ln]
+    return "\n".join(lines[marks[-2] + 1: marks[-1]]) if len(marks) >= 2 else code
+
+
+@dataclass
+class ValsCompetitionTools(CompetitionTools):
+    @tool
+    async def cpp_executor(
+        self,
+        cpp_code: Annotated[str, "The C++20 program, optionally inside a code block."],
+        stdin: Annotated[str, "Text passed to the program on standard input."] = "",
+    ) -> ToolResult:
+        """Compile a C++20 program (g++ -O2) and run it once with the given stdin. Returns stdout, stderr and the exit code. Runs are killed after 10 seconds. Use it for experiments, brute-force checkers and generators."""
+        self.n_run_calls += 1
+        code = _vals_extract(cpp_code)
+        if not code.strip():
+            return simple_tool_result("No C++ code found in the input")
+        r = await run_program(self.pool, code, stdin or "", time_limit=10.0, memory_mb=self.task.memory_mb,
+                              output_chars=VALS_OUTPUT_LIMIT)
+        if "infra_error" in r:
+            self.n_infra_errors += 1
+            return simple_tool_result("Internal error while running your code; please try again.",
+                                      metrics={"infra_error": 1.0})
+        if not r["compiled"]:
+            return simple_tool_result(f"Compilation failed:\n{_vals_clip(r['compile_stderr'])}")
+        if r["timed_out"]:
+            return simple_tool_result("Execution timed out after 10 seconds")
+        return simple_tool_result(_json.dumps({"exit_code": r["exit_code"] or 0, "stdout": _vals_clip(r["stdout"]),
+                                               "stderr": _vals_clip(r["stderr"])}))
+
+    @tool
+    async def submission(
+        self,
+        cpp_code: Annotated[str, "The full C++20 solution, optionally inside a code block."],
+    ) -> ToolResult:
+        """Submit a complete C++20 solution. It is compiled, run on the sample tests from the statement, and saved as your final answer; your last submission that compiles is the one graded on the hidden tests. Only sample results are reported, never hidden test results."""
+        if len(self.submissions) >= MAX_SUBMISSIONS:
+            return simple_tool_result(f"Submission limit of {MAX_SUBMISSIONS} reached; your last accepted submission stands.")
+        code = _vals_extract(cpp_code)
+        if not code.strip():
+            return simple_tool_result("No C++ code found in the input")
+        r = await check_samples(self.pool, code, self.task.sample_tests,
+                                time_limit=self.task.time_limit_s, memory_mb=self.task.memory_mb)
+        if "infra_error" in r:
+            self.n_infra_errors += 1
+            return simple_tool_result("Internal error while judging; this submission was not recorded. Please submit again.",
+                                      metrics={"infra_error": 1.0})
+        verdicts = [x["verdict"] for x in r["results"]]
+        self.submissions.append(Submission(time.time(), code, r["compiled"], verdicts))
+        remaining = MAX_SUBMISSIONS - len(self.submissions)
+        if not r["compiled"]:
+            return simple_tool_result(f"Compilation failed:\n{_vals_clip(r['compile_error'])}\n"
+                                      f"Not saved; your previous submission stands. Submissions remaining: {remaining}")
+        samples = {}
+        for x in r["results"]:
+            name = f"sample{x['sample']}"
+            if x["verdict"] == "accepted":
+                samples[name] = "passed"
+            elif x["verdict"] == "time_limit":
+                samples[name] = "time limit exceeded"
+            elif x["verdict"] == "runtime_error":
+                samples[name] = f"runtime error: {_vals_clip(x.get('stderr', ''))}"
+            else:
+                samples[name] = f"wrong answer, got:\n{_vals_clip(x.get('got', ''))}"
+        return simple_tool_result(_json.dumps({"saved": True, "samples": samples, "submissions_remaining": remaining}))
