@@ -152,30 +152,59 @@ class _LengthLog:
         if path:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
 
-    def add(self, batch: int, problem_id: str, tokens: list[int]) -> None:
+    def add(self, batch: int, problem_id: str, tokens: list[int], **extra) -> None:
         if not self.path:
             return
         rec = {"batch": batch, "problem_id": problem_id, "n_tokens": len(tokens),
-               "cut_off": not tokens or tokens[-1] not in self.stop_ids}
+               "cut_off": not tokens or tokens[-1] not in self.stop_ids, **extra}
         with self.lock, open(self.path, "a") as f:
             f.write(json.dumps(rec) + "\n")
 
 
+# Forced stop (--cutoff force): a student answer cut off while still thinking gets "\n</think>\n\n"
+# appended (as observation tokens: not trained) and one more sampling call to write the solution, so
+# the teacher scores and the student trains on a complete answer. Answers still cut off are dropped.
+FORCED_STOP_TEXT = "\n</think>\n\n"
+
+
 class _LoggedPromptOnlyEnv(PromptOnlyEnv):
-    def __init__(self, prompt, renderer, *, log: _LengthLog, batch: int, problem_id: str):
+    def __init__(self, prompt, renderer, *, log: _LengthLog, batch: int, problem_id: str,
+                 force_stop: list[int] | None = None, think_end: int | None = None):
         super().__init__(prompt, renderer)
         self._log, self._batch, self._pid = log, batch, problem_id
+        self._force, self._think_end, self._ob, self._turn = force_stop, think_end, None, 0
+
+    async def initial_observation(self):
+        ob, stop = await super().initial_observation()
+        self._ob = ob
+        return ob, stop
 
     async def step(self, action, *, extra=None):
-        self._log.add(self._batch, self._pid, list(action))
+        from tinker_cookbook.rl.types import StepResult
+
+        tokens = list(action)
+        cut = not tokens or tokens[-1] not in self._log.stop_ids
+        if self._turn == 0:
+            force = bool(self._force and cut and self._think_end not in tokens)
+            self._log.add(self._batch, self._pid, tokens, forced=force)
+            if force:
+                import tinker
+
+                self._turn = 1
+                nxt = tinker.ModelInput.from_ints(self._ob.to_ints() + tokens + list(self._force))
+                return StepResult(reward=0.0, episode_done=False, next_observation=nxt,
+                                  next_stop_condition=self.stop_condition, metrics={"forced_stop": 1.0})
+        else:
+            self._log.add(self._batch, self._pid, tokens, kind="forced_answer")
         return await super().step(action, extra=extra)
 
 
 class DistillDataset:
-    """SDFTBatchProvider over our JSONL: (builders, student prompts, privileged contexts) per batch."""
+    """SDFTBatchProvider over our JSONL: (builders, student prompts, privileged contexts) per batch.
+    cutoff: keep | drop | force (see FORCED_STOP_TEXT; drop/force also need `training_controls`)."""
 
     def __init__(self, rows: list[dict], batch_size: int, group_size: int, renderer: renderers.Renderer,
-                 seed: int = 0, epochs: int = 1, length_log_path: str | None = None):
+                 seed: int = 0, epochs: int = 1, length_log_path: str | None = None, cutoff: str = "keep"):
         rows = list(rows)
         order: list[dict] = []
         for e in range(epochs):
@@ -184,6 +213,11 @@ class DistillDataset:
             order += r
         self.rows, self.batch_size, self.group_size, self.renderer = order, batch_size, group_size, renderer
         self.log = _LengthLog(length_log_path, renderer.get_stop_sequences())
+        self.force_stop = self.think_end = None
+        if cutoff == "force":
+            tok = renderer.tokenizer
+            self.force_stop = tok.encode(FORCED_STOP_TEXT, add_special_tokens=False)
+            (self.think_end,) = tok.encode("</think>", add_special_tokens=False)
 
     @classmethod
     def from_files(cls, files: Sequence[str], **kw) -> "DistillDataset":
@@ -193,7 +227,8 @@ class DistillDataset:
         batch = self.rows[index * self.batch_size : (index + 1) * self.batch_size]
         builders = [
             ProblemGroupBuilder(env_thunk=partial(_LoggedPromptOnlyEnv, r["question"], self.renderer, log=self.log,
-                                                  batch=index, problem_id=r["problem_id"]),
+                                                  batch=index, problem_id=r["problem_id"],
+                                                  force_stop=self.force_stop, think_end=self.think_end),
                                 num_envs=self.group_size, dataset_name=f"sd_{r['context_type']}")
             for r in batch
         ]
@@ -201,3 +236,117 @@ class DistillDataset:
 
     def __len__(self) -> int:
         return math.ceil(len(self.rows) / self.batch_size)
+
+
+# ---------------------------------------------------------------- training controls (patches on sdft)
+
+
+def lr_at(step: int, total: int, base: float, schedule: str = "constant", warmup: int = 0,
+          min_frac: float = 0.0) -> float:
+    """Linear warmup over `warmup` steps, then constant / linear / cosine decay to min_frac * base."""
+    if warmup and step < warmup:
+        return base * (step + 1) / warmup
+    if schedule == "constant":
+        return base
+    p = min(1.0, (step - warmup) / max(1, total - warmup))
+    f = 1 - p if schedule == "linear" else 0.5 * (1 + math.cos(math.pi * p))
+    return base * (min_frac + (1 - min_frac) * f)
+
+
+class TrainState:
+    """Shared between the patches and the eval guard: the step the next eval belongs to."""
+
+    def __init__(self, step: int = 0):
+        self.step = step
+        self.cutoff_stats: dict[str, float] = {}
+
+
+@contextlib.contextmanager
+def training_controls(state: TrainState, lr_fn, cutoff: str, stop_ids: Sequence[int]):
+    """Per-step learning rate and cut-off dropping for the cookbook SDFT loop, which has neither.
+
+    sdft.main calls `train_step` / `_train_step_reverse_kl` (module globals) with a constant
+    cfg.learning_rate and a metrics dict holding "progress/batch"; the wrappers swap in lr_fn(step).
+    With cutoff drop/force, `assemble_training_data` drops datums whose last token isn't a stop
+    token (never finished), before the teacher scores them, so they cost sampling only. A step with
+    nothing left skips the optimizer step (logged as distill/skipped_step)."""
+    from tinker_cookbook.distillation import sdft
+
+    stop = set(stop_ids)
+    orig_train, orig_rev, orig_assemble = sdft.train_step, sdft._train_step_reverse_kl, sdft.assemble_training_data
+
+    def assemble(*a, **kw):
+        data_D, metadata_D = orig_assemble(*a, **kw)
+        if cutoff == "keep":
+            return data_D, metadata_D
+        keep = [i for i, d in enumerate(data_D) if int(d.loss_fn_inputs["target_tokens"].data[-1]) in stop]
+        state.cutoff_stats = {"distill/datums_total": float(len(data_D)), "distill/datums_kept": float(len(keep)),
+                              "distill/cutoff_dropped_frac": 1 - len(keep) / max(1, len(data_D))}
+        return [data_D[i] for i in keep], [metadata_D[i] for i in keep]
+
+    def wrap(orig):
+        async def run(*a, learning_rate: float, metrics: dict | None = None, **kw):
+            step = int((metrics or {}).get("progress/batch", state.step))
+            lr = lr_fn(step)
+            if metrics is not None:
+                metrics["optim/lr"] = lr
+                metrics.update(state.cutoff_stats)
+            data = kw.get("data_D", a[0] if a else None)
+            try:
+                if not data:
+                    if metrics is not None:
+                        metrics["distill/skipped_step"] = 1.0
+                    return []
+                return await orig(*a, learning_rate=lr, metrics=metrics, **kw)
+            finally:
+                state.step = step + 1
+                state.cutoff_stats = {}
+        return run
+
+    sdft.train_step, sdft._train_step_reverse_kl = wrap(orig_train), wrap(orig_rev)
+    sdft.assemble_training_data = assemble
+    try:
+        yield state
+    finally:
+        sdft.train_step, sdft._train_step_reverse_kl, sdft.assemble_training_data = orig_train, orig_rev, orig_assemble
+
+
+class EarlyStop(Exception):
+    pass
+
+
+class GuardedEvaluator:
+    """Wraps an in-training evaluator: appends every result to <log_path>/evals.jsonl and, if
+    `max_drop` is set, stops the run (EarlyStop, after writing early_stop.json) once `metric` falls
+    more than `max_drop` below its first recorded value (step 0)."""
+
+    def __init__(self, inner, state: TrainState, log_path: str, metric: str | None = None,
+                 max_drop: float | None = None):
+        self.inner, self.state, self.metric, self.max_drop = inner, state, metric, max_drop
+        self.path = Path(log_path) / "evals.jsonl"
+
+    def history(self) -> list[dict]:
+        return [json.loads(line) for line in open(self.path)] if self.path.exists() else []
+
+    async def __call__(self, sampling_client, final: bool = False) -> dict[str, float]:
+        m = await self.inner(sampling_client)
+        rec = {"step": self.state.step, "final": final, **m}
+        past = [r for r in self.history() if self.metric in r]
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        val = m.get(self.metric) if self.metric else None
+        n = next((v for k, v in m.items() if k.endswith("/n")), None)
+        if self.max_drop is None or val is None or not n:
+            return m
+        base = past[0] if past else rec
+        if base[self.metric] - val > self.max_drop:
+            best = max(past + [rec], key=lambda r: r[self.metric])
+            info = {"step": rec["step"], "metric": self.metric, "value": val, "baseline": base[self.metric],
+                    "baseline_step": base["step"], "max_drop": self.max_drop,
+                    "best_step": best["step"], "best_value": best[self.metric]}
+            (self.path.parent / "early_stop.json").write_text(json.dumps(info, indent=2))
+            raise EarlyStop(f"{self.metric} {val:.3f} at step {rec['step']} is more than {self.max_drop} below "
+                            f"step {base['step']}'s {base[self.metric]:.3f}; best was step {best['step']} "
+                            f"({best[self.metric]:.3f})")
+        return m
