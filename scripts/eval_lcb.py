@@ -201,11 +201,22 @@ async def run(args) -> Path:
 
     renderer_name = args.renderer or get_recommended_renderer_name(args.model)
     renderer = renderers.get_renderer(renderer_name, get_tokenizer(args.model), model_name=args.model)
-    sc = tinker.ServiceClient()
-    if args.model_path:
-        client = await sc.create_sampling_client(model_path=args.model_path)
+    if args.endpoint:  # a model served on Modal (scripts/serve_hf_model.py), e.g. a teacher not on Tinker
+        from cppgrade.endpoint_sampler import EndpointSampler
+
+        url = args.endpoint
+        if url == "modal":
+            from scripts.serve_hf_model import endpoint_url
+            url = endpoint_url()
+        key = (ROOT / "data" / "serve_api_key").read_text().strip()
+        client = EndpointSampler(url, key, get_tokenizer(args.model), renderer.get_stop_sequences())
+        print(f"sampling from endpoint {url}")
     else:
-        client = await sc.create_sampling_client(base_model=args.model)
+        sc = tinker.ServiceClient()
+        if args.model_path:
+            client = await sc.create_sampling_client(model_path=args.model_path)
+        else:
+            client = await sc.create_sampling_client(base_model=args.model)
     params = tinker.SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
@@ -289,6 +300,9 @@ def main():
     ap.add_argument("--name", help="output dir name under runs/evals/")
     ap.add_argument("--model", default="Qwen/Qwen3-8B", help="base model (also picks tokenizer/renderer)")
     ap.add_argument("--model-path", default=None, help="tinker://... sampler checkpoint; default = base model")
+    ap.add_argument("--endpoint", default=None,
+                    help="sample from an OpenAI-compatible endpoint instead of Tinker: a URL, or 'modal' for "
+                         "the app deployed by scripts/serve_hf_model.py (--model must name the served model)")
     ap.add_argument("--renderer", default=None, help="e.g. qwen3_disable_thinking; default = recommended")
     ap.add_argument("--langs", default="cpp,python")
     ap.add_argument("--split", default="v6_2408_2505")
