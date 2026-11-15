@@ -139,6 +139,54 @@ uv run python scripts/train_distill.py --name opd-27b-9b-v1 --data data/distill/
 - **Student budget:** `--max-tokens` defaults to 24000. The dry run checks that teacher prompt plus completion fits the 32K context; overlong completions are trimmed before scoring.
 - **Teacher model:** in self-distillation, the teacher is always the base model, even with `--load-checkpoint`. Use `--teacher-sync-every N` to copy the student into the teacher periodically; that option is refused with a different teacher.
 - **Answer lengths:** `runs/train/<name>/student_lengths.jsonl` records every student answer's length and whether it was cut off, per step. The cookbook loop only logs means.
+- **Controls the cookbook loop lacks** (added in `posttrain/distill.py`; the defaults keep the old behaviour):
+  - `--lr-schedule constant|linear|cosine`, `--warmup-steps N`, `--min-lr-frac`: the per-step LR is logged as `optim/lr`.
+  - `--cutoff keep|drop|force`, for answers that hit `--max-tokens`.
+    - `drop`: the answer isn't scored or trained, so it costs sampling only.
+    - `force`: append `</think>`, sample the solution, then train; the forced tokens aren't trained.
+  - `--early-stop-drop 0.10`: stops the run cleanly when held-out `single/pass@1` falls more than 10 points below step 0. It writes `early_stop.json`, and a resume won't continue past it.
+    - Every eval goes to `evals.jsonl`, and `--eval-final` evaluates the last checkpoint too.
+    - Use `--save-every` equal to `--eval-every`, so each evaluated step has a checkpoint.
+  - `--reverse`: the cookbook's analytical reverse KL over the teacher's top-K (mode-seeking). Its training is probably billed about 2×, because the client-side custom loss runs a forward pass and then a forward/backward.
+  - `--length-prior runs/train/<old>/student_lengths.jsonl`: the dry-run cost estimate uses the lengths from that run's first steps.
+- **On Modal** (`scripts/train_distill_modal.py`): same pattern and flags as the RL launcher, with the `tinker-api` secret and the `cpp-posttrain-runs` volume.
+  - `--check` runs the dry run inside the container, which is free.
+  - `modal run --detach ... --name X ...` starts it; `--pull X` copies results back.
+  - The launcher refuses to delete or resume a folder that isn't a distillation run.
+
+## Agentic RL (`posttrain/rl_env.py`, `scripts/train_rl.py`, `scripts/train_rl_modal.py`)
+
+RL in the competition environment, using the cookbook's `rl/train.py` loop. Each step runs 8 tasks with 4 sessions each. A session uses the `run_cpp` and `submit` tools, and its last compiling submission is graded on the hidden tests. Tasks come from the `rl` part of the pool, rated 1400–2200 (639 problems).
+
+```bash
+uv run python scripts/train_rl.py --name rl-v1 --dry-run                                     # config, pool, worst-case cost
+uv run python scripts/train_rl.py --name rl-v1 --load-checkpoint tinker://.../weights/final   # local
+uv run python scripts/train_rl.py --summarize runs/train/rl-v1                                # per-step tables
+```
+
+- **Reward:** `score/100 - 0.01 × turns` when the score is above 0, and 0 otherwise; then `- 0.05` per malformed turn.
+  - It's computed after each group finishes, so a session that was cut off or ended on malformed calls is still graded on its last compiling submission.
+  - Groups where every session got the same reward are dropped, since they carry no signal.
+- **Defaults:**
+  - 16K tokens per turn, 8 turns, 64K context, LoRA rank 32, lr 4e-5.
+  - Async: sampling runs at most 1 step ahead of training.
+  - A full checkpoint every 5 steps, and a state-only resume point every step.
+- **`--load-checkpoint`** needs a *state* path (`…/weights/…`), not `sampler_weights`.
+- **Logs:**
+  - `rollouts.jsonl` has one line per session, including groups dropped for constant reward.
+  - `metrics.jsonl` has the cookbook's metrics: `env/all/rl/*`, `time/*`, `tokens/*`, and `cost/step_usd` at Tinker's published rates.
+
+**On Modal** (the laptop can close). The training loop runs in a CPU container, and the run folder lives on the Volume `cpp-posttrain-runs`.
+
+```bash
+uv run modal secret create tinker-api TINKER_API_KEY=...     # once
+uv run modal run --detach scripts/train_rl_modal.py --name rl-v1 --load-checkpoint tinker://.../weights/final
+uv run modal app logs <app id>                                # watch (the app id is printed at start; or `modal app list`)
+uv run modal app stop -y <app id>                             # stop (resume later with --if-exists resume)
+uv run modal run scripts/train_rl_modal.py --pull rl-v1       # copy to runs/train/rl-v1/
+```
+
+If the container is preempted, crashes or hits the 24h limit, it's retried up to 4 times. Each retry resumes from the newest checkpoint.
 
 ## Reference
 
