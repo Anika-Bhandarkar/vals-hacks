@@ -9,7 +9,7 @@ Reward (computed once per rollout in `compute_group_rewards`, however the episod
     no compiling submission:   0
     score == 0:                0
     fails a statement example: 0   (require_samples, on by default: see below)
-    score > 0:                 score / 100 - turn_penalty * turns
+    score > 0:                 score / 100 - turn_penalty * turns - post_submit_penalty * wasted turns
     always:                    - malformed_penalty * malformed turns
     optional (off by default): + partial_credit * bonus
 
@@ -18,6 +18,12 @@ failed the statement example: wrong programs paid by weak large-test groups (e.g
 the same answer). A graded submission that fails an example would almost surely fail the real hidden
 tests, so the score only counts when it passes them all. Costs a little on problems with several valid
 outputs (where an exact-match example can reject a correct answer).
+
+`wasted turns` = assistant turns after the turn that made the graded (last compiling) submission,
+not counting a final EXIT reply. They can't change the score, only the turn-count tiebreak. In rl-v1
+about half of solved sessions ran to the turn cap after their final submission, while a flat
+per-turn penalty also taxes the testing turns that lead to solves (solvers used more turns than
+non-solvers in 42 of 74 mixed groups). So the cheaper fix is a small flat penalty plus this one.
 
 `bonus` (0-1, cppgrade.grader.partial_credit): fraction of hidden tests passed beyond what the best
 constant-answer program ("YES" for every case, "-1", ...) passes, per small/large group, weighted
@@ -45,6 +51,7 @@ import asyncio
 import functools
 import json
 import time
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,6 +71,7 @@ class RewardSettings:
     partial_credit: float = 0.0      # weight of the above-trivial partial-credit bonus (0 = off)
     max_trivial: float = 0.5         # no bonus from a group whose constant-answer baseline is above this
     require_samples: bool = True     # score counts only if the graded submission passes every statement example
+    post_submit_penalty: float = 0.0 # per wasted turn after the final graded submission (score > 0 only)
 
 
 _POOL = None
@@ -99,6 +107,29 @@ def _is_exit_text(env) -> bool:
     c = last.get("content")
     text = c if isinstance(c, str) else "".join(p.get("text", "") for p in (c or []) if p.get("type") == "text")
     return text.strip().endswith("EXIT")
+
+
+def _text(m) -> str:
+    c = m.get("content")
+    return c if isinstance(c, str) else "".join(p.get("text", "") for p in (c or []) if isinstance(p, dict))
+
+
+def turns_after_final_submission(env, tools) -> int | None:
+    """Assistant turns after the one whose submit call produced the graded (last compiling)
+    submission; None if there is none. Located by that submit's own tool result ("Submission n/..."),
+    so tool calls that failed validation (and never reached the tool) don't throw the count off."""
+    sub = tools.last_compiling
+    if sub is None:
+        return None
+    n = max(i for i, s in enumerate(tools.submissions) if s is sub) + 1
+    marker = f"Submission {n}/"
+    turn, final_turn = 0, None
+    for m in env.message_env.history:
+        if m["role"] == "assistant":
+            turn += 1
+        elif m["role"] == "tool" and m.get("name") == "submit" and _text(m).startswith(marker):
+            final_turn = turn
+    return None if final_turn is None else turn - final_turn
 
 
 def rollout_stats(traj: Trajectory) -> dict:
@@ -153,10 +184,13 @@ class CompetitionGroupBuilder(EnvGroupBuilder):
             samples_ok = bool(sub and sub.sample_verdicts and all(v == "accepted" for v in sub.sample_verdicts))
             bonus = partial_credit(final, self.reward.max_trivial) if samples_ok else 0.0
             counted = score if (samples_ok or not self.reward.require_samples) else 0.0
-            base = counted / 100.0 - self.reward.turn_penalty * st["turns"] if counted > 0 else 0.0
+            exit_text = _is_exit_text(env)
+            after = turns_after_final_submission(env, tools)
+            wasted = max(0, after - int(exit_text)) if after is not None else 0
+            base = (counted / 100.0 - self.reward.turn_penalty * st["turns"]
+                    - self.reward.post_submit_penalty * wasted) if counted > 0 else 0.0
             base -= self.reward.malformed_penalty * st["malformed_turns"]
             r = base + self.reward.partial_credit * bonus
-            exit_text = _is_exit_text(env)
             m = {
                 "rl/score": score,
                 "rl/score_proportional": float(final.score_proportional),
@@ -174,6 +208,8 @@ class CompetitionGroupBuilder(EnvGroupBuilder):
                 "rl/infra_errors": float(tools.n_infra_errors + bool(final.infra_error)),
                 "rl/samples_ok": float(samples_ok),
                 "rl/score_voided": float(score > 0 and counted == 0),
+                "rl/wasted_turns": float(wasted),
+                "rl/wasted_turns_if_scored": float(wasted) if counted > 0 else 0.0,
                 "rl/partial_bonus": bonus,
                 "rl/bonus_only": float(bonus > 0 and score == 0),
             }
@@ -183,7 +219,7 @@ class CompetitionGroupBuilder(EnvGroupBuilder):
                 "rollout": k, "reward": round(r, 4), "reward_base": round(base, 4), "score": score, "score_counted": counted,
                 "score_proportional": float(final.score_proportional), "bonus": round(bonus, 4),
                 "samples_ok": samples_ok, "trivial_small": final.trivial_small, "trivial_large": final.trivial_large,
-                "exit": exit_text,
+                "exit": exit_text, "turns_after_final_submit": after, "wasted_turns": wasted,
                 "submissions": len(tools.submissions), "compiling": sum(s.compiled for s in tools.submissions),
                 "run_calls": tools.n_run_calls, "infra_errors": m["rl/infra_errors"],
                 "rollout_s": round(t0 - env.t_start, 1), "grade_s": round(grade_s, 1), **st,
@@ -197,6 +233,36 @@ class CompetitionGroupBuilder(EnvGroupBuilder):
 
     def logging_tags(self) -> list[str]:
         return ["competition"]
+
+
+def problem_history(rollout_files: Sequence[str]) -> dict[str, list[list[float]]]:
+    """problem id -> the raw scores of each visit (one visit = one group in one run)."""
+    visits: dict[tuple, list[float]] = {}
+    for f in rollout_files:
+        if not Path(f).exists():
+            raise SystemExit(f"--history: no {f} (pull the run first: scripts/train_rl_modal.py --pull <name>)")
+        for line in open(f):
+            r = json.loads(line)
+            visits.setdefault((f, r["batch"], r["problem_id"]), []).append(float(r["score"]))
+    out: dict[str, list[list[float]]] = {}
+    for (_, _, pid), scores in visits.items():
+        out.setdefault(pid, []).append(scores)
+    return out
+
+
+def classify_by_history(hist: dict[str, list[list[float]]]) -> dict[str, str]:
+    """'too_easy' if any visit was all 100, 'too_hard' if every visit was all 0, else 'mixed'.
+    (A group whose scores are all equal teaches nothing, and the policy only gets stronger, so an
+    all-100 problem stays easy; an all-0 problem is dropped only if it never produced a success.)"""
+    out = {}
+    for pid, vs in hist.items():
+        if any(len(v) > 1 and all(s == 100 for s in v) for v in vs):
+            out[pid] = "too_easy"
+        elif all(all(s == 0 for s in v) for v in vs):
+            out[pid] = "too_hard"
+        else:
+            out[pid] = "mixed"
+    return out
 
 
 @dataclass
@@ -235,14 +301,27 @@ class CompetitionDatasetBuilder(RLDatasetBuilder):
     partial_credit: float = 0.0
     max_trivial: float = 0.5
     require_samples: bool = True
+    post_submit_penalty: float = 0.0
+    history: tuple[str, ...] = ()        # rollouts.jsonl files of earlier runs: skip problems that taught nothing
+    history_skip: tuple[str, ...] = ("too_easy", "too_hard")  # which history classes to skip
+    hard_group_size: int | None = None   # larger groups for hard problems (more chance one rollout succeeds)
+    hard_min_rating: int = 1900
     log_path: str | None = None
     pool_size: int = 64
+
+    def problem_classes(self) -> dict[str, str]:
+        return classify_by_history(problem_history(self.history)) if self.history else {}
 
     def problems(self) -> list[dict]:
         from posttrain.problems import load_pool
 
+        skip = {pid for pid, c in self.problem_classes().items() if c in self.history_skip}
         return load_pool(part="rl", min_rating=self.min_rating, max_rating=self.max_rating,
-                         seed=self.seed, limit=self.limit)
+                         seed=self.seed, limit=self.limit, exclude_ids=skip)
+
+    def group_size_for(self, p: dict) -> int:
+        hard = self.hard_group_size and (p.get("rating") or 0) >= self.hard_min_rating
+        return self.hard_group_size if hard else self.group_size
 
     async def __call__(self) -> tuple[RLDataset, RLDataset | None]:
         env = EnvSettings(
@@ -251,13 +330,18 @@ class CompetitionDatasetBuilder(RLDatasetBuilder):
             max_consecutive_parse_errors=self.max_consecutive_parse_errors,
             parse_error_penalty=0.0,  # the malformed penalty is applied in compute_group_rewards
         )
+        if self.history:
+            classes = self.problem_classes()
+            print(f"problem history from {len(self.history)} run(s): {dict(Counter(classes.values()))} "
+                  f"(skipping: {', '.join(self.history_skip)})", flush=True)
         reward = RewardSettings(turn_penalty=self.turn_penalty, malformed_penalty=self.malformed_penalty,
                                 partial_credit=self.partial_credit, max_trivial=self.max_trivial,
-                                require_samples=self.require_samples)
+                                require_samples=self.require_samples,
+                                post_submit_penalty=self.post_submit_penalty)
 
         def make_builder(p: dict, batch: int) -> CompetitionGroupBuilder:
             return CompetitionGroupBuilder(problem=p, model_name=self.model_name, renderer_name=self.renderer_name,
-                                           group_size=self.group_size, env=env, reward=reward, batch=batch,
+                                           group_size=self.group_size_for(p), env=env, reward=reward, batch=batch,
                                            log_path=self.log_path, pool_size=self.pool_size)
 
         return CompetitionDataset(self.problems(), self.groups_per_batch, make_builder), None
