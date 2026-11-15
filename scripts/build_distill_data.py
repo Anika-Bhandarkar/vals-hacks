@@ -52,6 +52,8 @@ def main():
     ap.add_argument("--max-pass-rate", type=float, default=1.0)
     ap.add_argument("--min-rating", type=int, default=0)
     ap.add_argument("--max-rating", type=int, default=10_000)
+    ap.add_argument("--part", default="distill", choices=["distill", "rl", "holdout", "all"],
+                    help="which disjoint part of the training pool (posttrain.problems.PARTS); RL uses 'rl'")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -75,7 +77,8 @@ def main():
                 refs[r["meta"]["problem_id"]].append(code)
     rates = json.loads(Path(args.pass_rates).read_text()) if args.pass_rates else {}
 
-    pool = load_pool(min_rating=args.min_rating, max_rating=args.max_rating, seed=args.seed)
+    pool = load_pool(min_rating=args.min_rating, max_rating=args.max_rating, seed=args.seed,
+                     part=None if args.part == "all" else args.part)
     rows, why = [], Counter()
     for p in pool:
         if rates and p["id"] in rates and not (args.min_pass_rate <= rates[p["id"]] <= args.max_pass_rate):

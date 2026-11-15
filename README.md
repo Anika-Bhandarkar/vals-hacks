@@ -126,6 +126,10 @@ uv run python scripts/train_distill.py --name opd-27b-9b-v1 --data data/distill/
     --model Qwen/Qwen3.5-9B --teacher-model Qwen/Qwen3.8-27B --lora-rank 32 --max-tokens 24000 --eval-single 30 --eval-every 10
 ```
 
+- **Pool parts:** the training pool is split into disjoint parts (`posttrain/problems.py`): `distill` 40%, `rl` 50%, `holdout` 10%. The split is by contest round, with re-posted problems grouped together, and the same problem always lands in the same part.
+  - `build_distill_data.py` uses `--part distill` by default.
+  - RL uses `load_pool(part="rl")`.
+  - Never train on `holdout`; it's for checking memorization.
 - **Context types:**
   - `editorial`: the official solution sketch, with code stripped.
   - `tags`: topic tags only, a weak hint.
