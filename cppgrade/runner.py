@@ -1,7 +1,13 @@
-"""Runs INSIDE the Modal sandbox. Compiles sol.cpp, runs it on tests.json, prints one JSON line.
+"""Runs INSIDE the Modal sandbox. Compiles the solution, then either:
 
-Output comparison happens here (not on your laptop) so only small verdicts cross
-the wire; the sandbox stdout stream is capped at ~128KB.
+  mode "tests" (default): runs it on every test, compares output, prints one JSON line of verdicts
+  mode "run":             runs it once on run_input.txt, prints stdout/stderr/exit code/time
+
+Output comparison happens here (not on your laptop) so only small verdicts cross the wire; the
+sandbox stdout stream is capped at ~128KB.
+
+The program's stdout/stderr go to size-capped files (RLIMIT_FSIZE), never into this process's
+memory: a wrong solution that prints in a loop until the time limit used to OOM the sandbox.
 
 Stdlib only, so the sandbox image stays tiny.
 Usage: python3 runner.py config.json
@@ -11,19 +17,43 @@ import gzip
 import json
 import os
 import resource
+import signal
 import subprocess
 import sys
 import time
 
 SNIP = 400  # chars of stdout/stderr kept per failing test, for debugging
+OUTPUT_LIMIT_RCS = (-signal.SIGXFSZ, 128 + signal.SIGXFSZ)
 
 
-def _limit_memory(mb: int):
+def _preexec(memory_mb: int | None, out_cap: int):
     def fn():
-        b = mb * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (b, b))
+        if memory_mb:
+            b = memory_mb * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (b, b))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (out_cap, out_cap))
 
     return fn
+
+
+def _run_once(cmd, stdin_path, time_limit, memory_mb, out_cap):
+    """Returns (rc or None if timed out, elapsed, stdout_text, stderr_text)."""
+    with open(stdin_path, "rb") as fin, open("out.txt", "wb") as fout, open("err.txt", "wb") as ferr:
+        start = time.time()
+        p = subprocess.Popen(cmd, stdin=fin, stdout=fout, stderr=ferr, preexec_fn=_preexec(memory_mb, out_cap))
+        try:
+            rc = p.wait(timeout=time_limit)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            rc = None
+        elapsed = time.time() - start
+    with open("out.txt", "rb") as f:
+        out = f.read(out_cap).decode("utf-8", "replace")
+    with open("err.txt", "rb") as f:
+        f.seek(max(0, os.path.getsize("err.txt") - 16 * SNIP))
+        err = f.read().decode("utf-8", "replace")
+    return rc, elapsed, out, err
 
 
 def _tokens_match(got: str, want: str, float_tol: float) -> bool:
@@ -44,13 +74,20 @@ def _tokens_match(got: str, want: str, float_tol: float) -> bool:
     return True
 
 
-def main():
-    cfg = json.load(open(sys.argv[1]))
+def _load_tests(cfg):
     if cfg.get("tests_file"):
         with gzip.open(cfg["tests_file"], "rt") as f:
-            tests = json.load(f)
-    else:
-        tests = json.load(open("tests.json"))
+            return json.load(f)
+    return json.load(open("tests.json"))
+
+
+def main():
+    cfg = json.load(open(sys.argv[1]))
+    mode = cfg.get("mode", "tests")
+    tests = _load_tests(cfg) if mode == "tests" else []
+    out_cap = cfg.get("output_limit_bytes", 64 * 1024 * 1024)
+    # ASan reserves huge virtual ranges, so RLIMIT_AS would kill it spuriously.
+    mem = None if cfg["sanitize"] else cfg["memory_mb"]
 
     lang = cfg.get("lang", "cpp")
     if lang == "python":
@@ -63,12 +100,7 @@ def main():
 
     t0 = time.time()
     try:
-        c = subprocess.run(
-            build,
-            capture_output=True,
-            text=True,
-            timeout=cfg["compile_timeout"],
-        )
+        c = subprocess.run(build, capture_output=True, text=True, timeout=cfg["compile_timeout"])
     except subprocess.TimeoutExpired:
         print(json.dumps({"compiled": False, "n_tests": len(tests), "compile_stderr": "COMPILE_TIMEOUT", "compile_s": time.time() - t0}))
         return
@@ -77,30 +109,35 @@ def main():
         print(json.dumps({"compiled": False, "n_tests": len(tests), "compile_stderr": c.stderr[-8000:], "compile_s": compile_s}))
         return
 
+    if mode == "run":
+        cap = cfg.get("run_output_chars", 4000)
+        rc, elapsed, out, err = _run_once(run_cmd, "run_input.txt", cfg["time_limit"], mem, out_cap)
+        print(json.dumps({
+            "compiled": True, "compile_stderr": c.stderr[-2000:], "compile_s": compile_s,
+            "timed_out": rc is None, "exit_code": rc, "time_s": round(elapsed, 3),
+            "output_limit": rc in OUTPUT_LIMIT_RCS,
+            "stdout": out[:cap], "stdout_truncated": len(out) > cap,
+            "stderr": err[-cap // 2:],
+        }))
+        return
+
     results = []
     for i, t in enumerate(tests):
-        start = time.time()
-        rec = {"idx": i}
-        try:
-            p = subprocess.run(
-                run_cmd,
-                input=t["input"].encode(),
-                capture_output=True,
-                timeout=cfg["time_limit"],
-                # ASan reserves huge virtual ranges, so RLIMIT_AS would kill it spuriously.
-                preexec_fn=None if cfg["sanitize"] else _limit_memory(cfg["memory_mb"]),
-            )
-            out = p.stdout.decode("utf-8", "replace")
-            err = p.stderr.decode("utf-8", "replace")
-            if p.returncode != 0:
-                rec.update(status="runtime_error", rc=p.returncode, stderr=err[-SNIP * 4 :])
-            elif _tokens_match(out, t["output"], cfg["float_tol"]):
-                rec.update(status="ok")
-            else:
-                rec.update(status="wrong_answer", got=out[:SNIP], want=t["output"][:SNIP])
-        except subprocess.TimeoutExpired:
+        with open("in.txt", "w") as f:
+            f.write(t["input"])
+        rc, elapsed, out, err = _run_once(run_cmd, "in.txt", cfg["time_limit"], mem, out_cap)
+        rec = {"idx": i, "in_bytes": len(t["input"])}
+        if rc is None:
             rec.update(status="time_limit")
-        rec["elapsed"] = round(time.time() - start, 3)
+        elif rc in OUTPUT_LIMIT_RCS:
+            rec.update(status="runtime_error", rc=rc, stderr="OUTPUT_LIMIT_EXCEEDED")
+        elif rc != 0:
+            rec.update(status="runtime_error", rc=rc, stderr=err[-SNIP * 4 :])
+        elif _tokens_match(out, t["output"], cfg["float_tol"]):
+            rec.update(status="ok")
+        else:
+            rec.update(status="wrong_answer", got=out[:SNIP], want=t["output"][:SNIP])
+        rec["elapsed"] = round(elapsed, 3)
         results.append(rec)
         if cfg["stop_on_first_failure"] and rec["status"] != "ok":
             break

@@ -179,7 +179,11 @@ def classify_runtime(rc: int, stderr: str, lang: str = "cpp") -> str:
         m = re.findall(r"^(\w+(?:Error|Exception|Exit|Interrupt))\b", stderr, re.MULTILINE)
         if m:
             return m[-1]
+        if stderr == "OUTPUT_LIMIT_EXCEEDED":
+            return "output_limit"
         return "killed" if rc < 0 else "nonzero_exit"
+    if stderr == "OUTPUT_LIMIT_EXCEEDED":
+        return "output_limit"
     if "AddressSanitizer" in stderr:
         if re.search(r"(heap|stack|global)-buffer-overflow|out of bounds", stderr):
             return "asan_oob"
@@ -214,6 +218,46 @@ class GradeResult:
         return asdict(self)
 
 
+def _flags(sanitize: bool, cpp_std: str) -> list[str]:
+    flags = SANITIZE_FLAGS if sanitize else BASE_FLAGS
+    return [f"-std={cpp_std}" if f.startswith("-std=") else f for f in flags]
+
+
+async def _execute(
+    pool: ModalSandboxPool | OnDemandPool,
+    code: str,
+    cfg: dict[str, Any],
+    *,
+    lang: str = "cpp",
+    tests: list[dict[str, str]] | None = None,
+    extra_files: dict[str, str] | None = None,
+    budget: int,
+    retries: int = 2,
+) -> tuple[dict[str, Any] | None, str]:
+    """Run runner.py in a fresh sandbox; retry on a new sandbox if Modal hiccups.
+    Returns (runner JSON, "") or (None, error description)."""
+    files = {
+        ("sol.cpp" if lang == "cpp" else "sol.py"): code,
+        "config.json": json.dumps(cfg),
+        "runner.py": RUNNER_SRC,
+        **(extra_files or {}),
+    }
+    if tests is not None:
+        files["tests.json"] = json.dumps(tests)
+    last_err = ""
+    for attempt in range(retries + 1):
+        res = None
+        try:
+            res = await pool.run_in_workdir(files, ["python3", "runner.py", "config.json"], timeout=budget)
+            return json.loads(res.stdout.strip().splitlines()[-1]), ""
+        except (IndexError, json.JSONDecodeError):
+            last_err = f"exit={res.exit_code} stderr={res.stderr[-1000:]}" if res else "no result"
+        except Exception as e:  # sandbox died / Modal hiccup: retry on a fresh sandbox
+            last_err = f"{type(e).__name__}: {e}"
+        logger.warning("sandbox attempt %d failed: %s", attempt + 1, last_err[:200])
+    return None, last_err
+
+
 async def grade(
     pool: ModalSandboxPool | OnDemandPool,
     model_output: str,
@@ -230,6 +274,7 @@ async def grade(
     stop_on_first_failure: bool = True,
     compile_timeout: int = 60,
     lang: str = "cpp",
+    cpp_std: str = "c++17",
 ) -> GradeResult:
     """Grade one completion. Pass `code` to skip extraction (e.g. reference solutions).
 
@@ -256,7 +301,7 @@ async def grade(
 
     cfg = {
         "lang": lang,
-        "compile_flags": SANITIZE_FLAGS if sanitize else BASE_FLAGS,
+        "compile_flags": _flags(sanitize, cpp_std),
         "compile_timeout": compile_timeout,
         "time_limit": time_limit * (3 if sanitize else 1),
         "memory_mb": memory_mb,
@@ -265,26 +310,8 @@ async def grade(
         "stop_on_first_failure": stop_on_first_failure,
         "tests_file": f"{TESTS_MOUNT}/{tests_file}" if tests_file else None,
     }
-    files = {
-        ("sol.cpp" if lang == "cpp" else "sol.py"): code,
-        "config.json": json.dumps(cfg),
-        "runner.py": RUNNER_SRC,
-    }
-    if tests is not None:
-        files["tests.json"] = json.dumps(tests)
     budget = compile_timeout + int(cfg["time_limit"] * max(total, 1)) + 60
-
-    out, last_err = None, ""
-    for attempt in range(retries + 1):
-        try:
-            res = await pool.run_in_workdir(files, ["python3", "runner.py", "config.json"], timeout=budget)
-            out = json.loads(res.stdout.strip().splitlines()[-1])
-            break
-        except (IndexError, json.JSONDecodeError):
-            last_err = f"exit={res.exit_code} stderr={res.stderr[-1000:]}"
-        except Exception as e:  # sandbox died / Modal hiccup: retry on a fresh sandbox
-            last_err = f"{type(e).__name__}: {e}"
-        logger.warning("grade attempt %d failed: %s", attempt + 1, last_err[:200])
+    out, last_err = await _execute(pool, code, cfg, lang=lang, tests=tests, budget=budget, retries=retries)
     if out is None:
         return GradeResult("infra_error", total=total, code=code, detail=last_err)
 
@@ -310,3 +337,145 @@ async def grade(
         return GradeResult("time_limit", None, passed, total, code=code, extra={"test": fail["idx"]})
     return GradeResult("wrong_answer", None, passed, total, code=code,
                        detail=f"got={fail['got']!r}\nwant={fail['want']!r}", extra={"test": fail["idx"]})
+
+
+# ---------------------------------------------------------------- agentic setting (run / samples / score)
+
+AGENT_STD = "c++20"  # the competition compiles C++20
+
+
+def _base_cfg(mode: str, time_limit: float, memory_mb: int, cpp_std: str, **kw) -> dict[str, Any]:
+    return {
+        "mode": mode, "lang": "cpp", "compile_flags": _flags(False, cpp_std), "compile_timeout": 60,
+        "time_limit": time_limit, "memory_mb": memory_mb, "sanitize": False, "float_tol": 1e-6,
+        "stop_on_first_failure": False, "tests_file": None, **kw,
+    }
+
+
+async def run_program(
+    pool: ModalSandboxPool | OnDemandPool,
+    code: str,
+    stdin: str,
+    *,
+    time_limit: float = 2.0,
+    memory_mb: int = 1024,
+    cpp_std: str = AGENT_STD,
+    output_chars: int = 4000,
+) -> dict[str, Any]:
+    """Compile and run once on `stdin`. Returns the runner's JSON: compiled, compile_stderr,
+    stdout, stderr, exit_code, timed_out, time_s, output_limit. On sandbox failure: {"infra_error": ...}."""
+    cfg = _base_cfg("run", time_limit, memory_mb, cpp_std, run_output_chars=output_chars)
+    out, err = await _execute(pool, code, cfg, extra_files={"run_input.txt": stdin}, budget=int(time_limit) + 90)
+    return out if out is not None else {"infra_error": err}
+
+
+def _verdict(rec: dict[str, Any]) -> str:
+    return {"ok": "accepted"}.get(rec["status"], rec["status"])
+
+
+async def check_samples(
+    pool: ModalSandboxPool | OnDemandPool,
+    code: str,
+    samples: list[dict[str, str]],
+    *,
+    time_limit: float = 2.0,
+    memory_mb: int = 1024,
+    cpp_std: str = AGENT_STD,
+) -> dict[str, Any]:
+    """Compile and run every sample test (no early stop). Returns
+    {"compiled", "compile_error", "results": [{"sample", "verdict", "got"?, "want"?}]} or {"infra_error"}."""
+    cfg = _base_cfg("tests", time_limit, memory_mb, cpp_std)
+    budget = 60 + int(time_limit * max(1, len(samples))) + 60
+    out, err = await _execute(pool, code, cfg, tests=samples, budget=budget)
+    if out is None:
+        return {"infra_error": err}
+    if not out["compiled"]:
+        return {"compiled": False, "compile_error": out["compile_stderr"][:3000], "results": []}
+    results = []
+    for r in out["results"]:
+        item = {"sample": r["idx"] + 1, "verdict": _verdict(r)}
+        if r["status"] == "wrong_answer":
+            item.update(got=r["got"], want=r["want"])
+        elif r["status"] == "runtime_error":
+            item.update(stderr=r.get("stderr", "")[-600:])
+        results.append(item)
+    return {"compiled": True, "compile_error": "", "results": results}
+
+
+@dataclass
+class ScoreResult:
+    """Hidden-test score for one submission, in the competition's 40 (small) / 60 (large) scheme."""
+
+    compiled: bool
+    score: float = 0.0               # all-or-nothing per group: 40 if every small test passes, +60 if every large one does
+    score_proportional: float = 0.0  # 40 * frac_small_passed + 60 * frac_large_passed
+    small_passed: int = 0
+    small_total: int = 0
+    large_passed: int = 0
+    large_total: int = 0
+    statuses: dict[str, int] = field(default_factory=dict)
+    compile_error: str = ""
+    infra_error: str = ""
+    per_test: list[tuple[int, str, str]] = field(default_factory=list)  # (input bytes, group, verdict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def split_small_large(
+    results: list[dict[str, Any]], small_frac: float = 0.4, size_cut: float = 0.01
+) -> tuple[list[int], list[int]]:
+    """Proxy for the competition's small/large hidden tests, which our datasets don't label.
+
+    Primary rule: "small" = input at most `size_cut` (1%) of this problem's largest input. That
+    matches "brute force fits" well when sizes spread over orders of magnitude (e.g. abc365_e:
+    5 tiny tests vs. 165KB-1.8MB ones, where a 400KB test already times out an O(N^2) brute).
+    Fallback when that rule puts <15% or >85% of tests in "small" (sizes barely vary, e.g.
+    single-number inputs): the smallest `small_frac` of tests by input size, by rank."""
+    n = len(results)
+    if n < 2:
+        return list(range(n)), []
+    mx = max(r["in_bytes"] for r in results)
+    small = [i for i, r in enumerate(results) if r["in_bytes"] <= size_cut * mx]
+    if not 0.15 * n <= len(small) <= 0.85 * n:
+        order = sorted(range(n), key=lambda i: (results[i]["in_bytes"], i))
+        small = order[: max(1, round(small_frac * n))]
+    small_set = set(small)
+    return sorted(small_set), [i for i in range(n) if i not in small_set]
+
+
+async def score_submission(
+    pool: ModalSandboxPool | OnDemandPool,
+    code: str,
+    *,
+    tests_file: str,
+    n_tests: int,
+    time_limit: float = 2.0,
+    memory_mb: int = 1024,
+    cpp_std: str = AGENT_STD,
+    small_frac: float = 0.4,
+) -> ScoreResult:
+    """Run ALL hidden tests (no early stop, partial credit needs every verdict) and score 0-100."""
+    cfg = _base_cfg("tests", time_limit, memory_mb, cpp_std, tests_file=f"{TESTS_MOUNT}/{tests_file}")
+    budget = 60 + int(time_limit * max(1, n_tests)) + 90
+    out, err = await _execute(pool, code, cfg, budget=budget)
+    if out is None:
+        return ScoreResult(compiled=False, infra_error=err)
+    if not out["compiled"]:
+        return ScoreResult(compiled=False, compile_error=out["compile_stderr"][:3000])
+    results = out["results"]
+    small, large = split_small_large(results, small_frac)
+    ok = lambda idxs: sum(results[i]["status"] == "ok" for i in idxs)
+    sp, lp = ok(small), ok(large)
+    if not large:  # every test counted as small: it carries the full 100
+        score = 100.0 * (sp == len(small))
+        prop = 100.0 * sp / max(1, len(small))
+    else:
+        score = 40.0 * (sp == len(small)) + 60.0 * (lp == len(large))
+        prop = 40.0 * sp / len(small) + 60.0 * lp / len(large)
+    statuses: dict[str, int] = {}
+    for r in results:
+        statuses[_verdict(r)] = statuses.get(_verdict(r), 0) + 1
+    small_set = set(small)
+    per_test = [(r["in_bytes"], "small" if i in small_set else "large", _verdict(r)) for i, r in enumerate(results)]
+    return ScoreResult(True, score, round(prop, 2), sp, len(small), lp, len(large), statuses, per_test=per_test)
