@@ -1,4 +1,4 @@
-"""Tinker smoke test: lists models (flagging <=9B active params), then samples one C++ answer
+"""Tinker smoke test: lists models (flagging <=9B total params), then samples one C++ answer
 and grades it on Modal.
 
     uv run python scripts/check_tinker.py                       # list + sample Qwen/Qwen3-8B
@@ -26,7 +26,7 @@ from tinker_cookbook import renderers  # noqa: E402
 from tinker_cookbook.model_info import get_model_attributes, get_recommended_renderer_name  # noqa: E402
 from tinker_cookbook.tokenizer_utils import get_tokenizer  # noqa: E402
 
-ACTIVE_LIMIT_B = 9.0
+LIMIT_B = 9.0  # organizers: 9B TOTAL parameters
 
 PROMPT = (
     "Read two integers a and b (|a|,|b| <= 1e18) from standard input and print a+b. "
@@ -38,27 +38,33 @@ TESTS = [
 ]
 
 
-def active_params_b(model_name: str) -> float | None:
-    """'30B-A3B' -> 3.0, '8B' -> 8.0, '21B-A3.6B' -> 3.6. None if unknown to the cookbook."""
+def param_counts_b(model_name: str) -> tuple[float | None, float | None]:
+    """Cookbook size string -> (total, active) in billions: '30B-A3B' -> (30, 3), '8B' -> (8, 8).
+    Names are rounded (Qwen3.5-9B is really 9.65B), so check HF for anything near the limit."""
     try:
         size = get_model_attributes(model_name).size_str
     except Exception:
-        return None
-    m = re.search(r"A([\d.]+)B", size) or re.match(r"([\d.]+)B", size)
-    return float(m.group(1)) if m else None
+        return None, None
+    tot = re.match(r"([\d.]+)B", size)
+    act = re.search(r"A([\d.]+)B", size)
+    total = float(tot.group(1)) if tot else None
+    return total, (float(act.group(1)) if act else total)
 
 
 def list_models(sc: tinker.ServiceClient) -> None:
     caps = tinker.RestClient().get_server_capabilities().result()
     rows = []
     for m in caps.supported_models:
-        act = active_params_b(m.model_name or "")
-        rows.append((m.model_name, act, m.trainable, m.max_context_length))
+        if ":" in (m.model_name or ""):  # long-context / quantized variants of the same weights
+            continue
+        total, act = param_counts_b(m.model_name or "")
+        rows.append((m.model_name, total, act, m.trainable, m.max_context_length))
     rows.sort(key=lambda r: (r[1] is None, r[1] or 0, r[0] or ""))
-    print(f"{'model':55} {'active':>7} {'train':>6} {'ctx':>8}  <=9B-active?")
-    for name, act, tr, ctx in rows:
-        ok = "yes" if act is not None and act <= ACTIVE_LIMIT_B else ("?" if act is None else "")
-        print(f"{name or '?':55} {('%.1fB' % act) if act else '?':>7} {str(tr):>6} {ctx or '?':>8}  {ok}")
+    print(f"{'model':55} {'total':>7} {'active':>7} {'train':>6} {'ctx':>8}  <=9B total?")
+    for name, total, act, tr, ctx in rows:
+        ok = "?" if total is None else ("yes" if total < LIMIT_B else "check" if total <= LIMIT_B + 0.5 else "")
+        fmt = lambda x: ("%.1fB" % x) if x else "?"
+        print(f"{name or '?':55} {fmt(total):>7} {fmt(act):>7} {str(tr):>6} {ctx or '?':>8}  {ok}")
 
 
 async def sample_and_grade(sc: tinker.ServiceClient, model: str, renderer_name: str | None, grade_it: bool):
