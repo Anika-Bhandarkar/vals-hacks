@@ -72,17 +72,32 @@ def load_agent_tasks(
 
 # ---------------------------------------------------------------- prompts (guesses until we see theirs)
 
-SYSTEM_PROMPT = f"""You are solving one competitive programming problem in C++20.
+SYSTEM_PROMPT_TEMPLATE = """You are solving one competitive programming problem in C++20.
 
 You have two tools:
 - run_cpp(code, stdin): compile your C++20 program and run it on any input you choose. Use it to test samples, your own edge cases, brute-force comparisons and timing on large generated inputs.
-- submit(code): submit a solution. It reports how the solution does on the sample tests. You may submit up to {MAX_SUBMISSIONS} times.
+- submit(code): submit a solution. It reports how the solution does on the sample tests. You may submit up to {max_submissions} times.
 
 Scoring: the LAST submission that compiles is graded on hidden tests. Small hidden tests are worth 40 points and large ones 60. A slower solution that is correct on small tests still earns those 40 points, but a later submission that compiles and is wrong replaces it.
-Limits per test: {TIME_LIMIT_S:g} seconds and {MEMORY_MB // 1024} GiB of memory.
+Limits per test: {limits}.
 Ties are broken by fewer total turns, so don't waste turns.
 
 When you are finished, reply with exactly: EXIT"""
+
+
+def format_limits(time_limit_s: float, memory_mb: int) -> str:
+    mem = f"{memory_mb // 1024} GiB" if memory_mb % 1024 == 0 else f"{memory_mb} MB"
+    unit = "second" if time_limit_s == 1 else "seconds"
+    return f"{time_limit_s:g} {unit} and {mem} of memory"
+
+
+def system_prompt(task: "AgentTask | None" = None) -> str:
+    """The system prompt with this task's limits (identical text to the baseline for 2 s / 1 GiB tasks)."""
+    t, m = (task.time_limit_s, task.memory_mb) if task else (TIME_LIMIT_S, MEMORY_MB)
+    return SYSTEM_PROMPT_TEMPLATE.format(max_submissions=MAX_SUBMISSIONS, limits=format_limits(t, m))
+
+
+SYSTEM_PROMPT = system_prompt()  # default limits; kept for backwards compatibility
 
 
 def _sample_files(task: AgentTask) -> str:
@@ -97,5 +112,18 @@ def render_task(task: AgentTask) -> str:
     return (
         f"--- problem.txt ---\n{task.title.upper()}\n\n{task.statement}\n\n"
         f"Sample test files:\n\n{_sample_files(task)}\n\n"
-        f"Limits: {task.time_limit_s:g} seconds and {task.memory_mb // 1024} GiB of memory per test."
+        f"Limits: {format_limits(task.time_limit_s, task.memory_mb)} per test."
+    )
+
+
+def task_from_codeforces(p: dict) -> AgentTask:
+    """A Codeforces problem (cppgrade.codeforces index row) in the competition task format."""
+    from cppgrade.codeforces import statement_body
+
+    return AgentTask(
+        question_id=p["id"], title=p["title"], statement=statement_body(p),
+        difficulty=str(p.get("rating") or "?"), contest_date=str(p.get("contest_start", "")),
+        samples=tuple((e["input"], e["output"]) for e in p["examples"]),
+        tests_file=p["tests_file"], n_tests=p["n_tests"],
+        time_limit_s=float(p["time_limit"]), memory_mb=max(256, int(p["memory_limit"])),
     )

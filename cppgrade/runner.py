@@ -138,6 +138,9 @@ def main():
         else:
             rec.update(status="wrong_answer", got=out[:SNIP], want=t["output"][:SNIP])
         rec["elapsed"] = round(elapsed, 3)
+        if rec["status"] != "ok" and cfg.get("report_input_chars"):
+            rec["input_head"] = t["input"][: cfg["report_input_chars"]]
+            rec["want_head"] = t["output"][: cfg["report_input_chars"]]
         results.append(rec)
         if cfg["stop_on_first_failure"] and rec["status"] != "ok":
             break
