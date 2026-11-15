@@ -100,6 +100,31 @@ uv run python scripts/eval_agentic.py --model Qwen/Qwen3-8B --model-path tinker:
 - **In-training evals** (`--eval-single N`, `--eval-agentic N`) run on the first N held-out LiveCodeBench problems, the same subset the eval scripts use. Keep N small; the eval scripts are the source of truth.
 - **Checkpoints and metrics:** `runs/train/<name>/checkpoints.jsonl` and `metrics.jsonl`. Periodic checkpoints expire after `--ttl-days`; the final one is kept.
 
+## Self-distillation (`posttrain/self_distill.py`, `scripts/build_sd_data.py`, `scripts/train_self_distill.py`)
+
+The same model plays student and teacher. The **student** (LoRA) sees only the problem and generates its own solution. The **teacher** is the frozen base model, which sees the problem plus a **privileged context** and scores the student's tokens. The student is trained toward the teacher's top-20 token distribution (the cookbook's SDFT loop). It learns what it would have written had it known the hint, without needing the hint at test time. There's no external teacher, so the tokenizer matches by construction.
+
+```bash
+# contexts (one row per training problem; priority order with a comma list)
+uv run python scripts/build_sd_data.py --context editorial --out data/sd/editorial.jsonl
+uv run python scripts/build_sd_data.py --context feedback --failures data/sft/rft_single.failures.jsonl --out data/sd/feedback.jsonl
+uv run python scripts/build_sd_data.py --context editorial,feedback,tags --failures data/sft/rft_single.failures.jsonl \
+    --pass-rates data/sft/rft_single.pass_rates.json --max-pass-rate 0.75 --out data/sd/mixed.jsonl
+
+# train (--dry-run: teacher prompt, context-length check, rough generation cost)
+uv run python scripts/train_self_distill.py --name sd-v1 --data data/sd/mixed.jsonl --dry-run
+uv run python scripts/train_self_distill.py --name sd-v1 --data data/sd/mixed.jsonl --batch-size 16 --group-size 4 --eval-single 30 --eval-every 10
+```
+
+- **Context types:**
+  - `editorial`: the official solution sketch, with code stripped.
+  - `tags`: topic tags only, a weak hint.
+  - `reference`: a correct solution, from `rft-single` or `traces` output.
+  - `feedback`: one of the model's own failed attempts and its verdict, from `rft-single`'s `.failures.jsonl`.
+- **Gate it on Test A first.** If the hinted model doesn't solve much more than the plain one, the teacher has nothing to teach.
+- **Student budget:** `--max-tokens` defaults to 24000. The dry run checks that teacher prompt plus completion fits the 32K context; overlong completions are trimmed before scoring.
+- **Teacher model:** the teacher is always the base model, even with `--load-checkpoint`. Use `--teacher-sync-every N` to copy the student into the teacher periodically.
+
 ## Reference
 
 - RL recipe to adapt: `tinker_cookbook/recipes/code_rl/` (DeepCoder-style, Python-graded; swap in `cppgrade.grade` for the reward).

@@ -6,7 +6,8 @@ Prereq: the training pool on the Modal volume (once):
 
 Sources:
   # 1. rejection sampling, single attempt: the model's own shortest correct answers.
-  #    Also writes <out>.pass_rates.json (per-problem pass rate; reuse it to pick RL problems with 0 < p < 1).
+  #    Also writes <out>.pass_rates.json (per-problem pass rate; reuse it to pick RL problems with 0 < p < 1)
+  #    and <out>.failures.jsonl (graded wrong attempts; self-distillation's "feedback" contexts).
   uv run python scripts/build_sft_data.py rft-single --out data/sft/rft_single.jsonl \
       --model Qwen/Qwen3-8B --pool-limit 500 --samples 4 --keep 1
 
@@ -134,8 +135,13 @@ async def rft_single(args) -> None:
                        source="rft-single", problem_id=p["id"], rating=p.get("rating"), n_tokens=len(seq.tokens),
                        pass_rate=sum(c[0] is not None and c[0].accepted for c in cands) / len(cands), code_hash=code_hash(g.code))
                 for g, seq, thinking, text in good[: args.keep]]
+        # Failed attempts (graded, not truncated) feed self-distillation's "feedback" contexts.
+        fails = [{"problem_id": p["id"], "code": g.code, "verdict": g.verdict, "subtype": g.subtype,
+                  "detail": g.detail[:1500], "passed": g.passed, "total": g.total, "n_tokens": len(seq.tokens)}
+                 for g, seq, thinking, text in cands if g is not None and not g.accepted and g.code]
         async with lock:
             write_jsonl(out, recs, append=True)
+            write_jsonl(out.with_suffix(".failures.jsonl"), fails, append=True)
             rates[p["id"]] = sum(c[0] is not None and c[0].accepted for c in cands) / len(cands)
             rates_path.write_text(json.dumps(rates))
             stats["problems"] += 1
