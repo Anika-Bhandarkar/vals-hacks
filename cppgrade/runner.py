@@ -7,6 +7,7 @@ Stdlib only, so the sandbox image stays tiny.
 Usage: python3 runner.py config.json
 """
 
+import gzip
 import json
 import os
 import resource
@@ -45,22 +46,35 @@ def _tokens_match(got: str, want: str, float_tol: float) -> bool:
 
 def main():
     cfg = json.load(open(sys.argv[1]))
-    tests = json.load(open("tests.json"))
+    if cfg.get("tests_file"):
+        with gzip.open(cfg["tests_file"], "rt") as f:
+            tests = json.load(f)
+    else:
+        tests = json.load(open("tests.json"))
+
+    lang = cfg.get("lang", "cpp")
+    if lang == "python":
+        # "Compile" = byte-compile, so SyntaxErrors land in the same bucket as C++ compile errors.
+        build = ["python3", "-m", "py_compile", "sol.py"]
+        run_cmd = ["python3", "sol.py"]
+    else:
+        build = ["g++", *cfg["compile_flags"], "-o", "sol", "sol.cpp"]
+        run_cmd = ["./sol"]
 
     t0 = time.time()
     try:
         c = subprocess.run(
-            ["g++", *cfg["compile_flags"], "-o", "sol", "sol.cpp"],
+            build,
             capture_output=True,
             text=True,
             timeout=cfg["compile_timeout"],
         )
     except subprocess.TimeoutExpired:
-        print(json.dumps({"compiled": False, "compile_stderr": "COMPILE_TIMEOUT", "compile_s": time.time() - t0}))
+        print(json.dumps({"compiled": False, "n_tests": len(tests), "compile_stderr": "COMPILE_TIMEOUT", "compile_s": time.time() - t0}))
         return
     compile_s = time.time() - t0
     if c.returncode != 0:
-        print(json.dumps({"compiled": False, "compile_stderr": c.stderr[-8000:], "compile_s": compile_s}))
+        print(json.dumps({"compiled": False, "n_tests": len(tests), "compile_stderr": c.stderr[-8000:], "compile_s": compile_s}))
         return
 
     results = []
@@ -69,7 +83,7 @@ def main():
         rec = {"idx": i}
         try:
             p = subprocess.run(
-                ["./sol"],
+                run_cmd,
                 input=t["input"].encode(),
                 capture_output=True,
                 timeout=cfg["time_limit"],
@@ -91,7 +105,7 @@ def main():
         if cfg["stop_on_first_failure"] and rec["status"] != "ok":
             break
 
-    print(json.dumps({"compiled": True, "compile_s": compile_s, "results": results}))
+    print(json.dumps({"compiled": True, "n_tests": len(tests), "compile_s": compile_s, "results": results}))
 
 
 if __name__ == "__main__":

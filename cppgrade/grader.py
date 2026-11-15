@@ -17,33 +17,99 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import logging
 import re
+import shlex
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import modal
-from tinker_cookbook.sandbox.modal_sandbox import ModalSandboxPool
+from tinker_cookbook.sandbox.modal_sandbox import ModalSandbox, ModalSandboxPool
+from tinker_cookbook.sandbox.sandbox_interface import SandboxResult
 
-APP_NAME = "cpp-posttrain-grader"
+from cppgrade.infra import APP_NAME, CPP_IMAGE, SANDBOX_CPU, SANDBOX_MEMORY_MB, TESTS_MOUNT, TESTS_VOLUME
+
+logger = logging.getLogger(__name__)
 RUNNER_SRC = (Path(__file__).parent / "runner.py").read_text()
-
-# Debian bookworm -> GCC 12. bits/stdc++.h available, same as most judges.
-CPP_IMAGE = modal.Image.debian_slim(python_version="3.12").apt_install("g++")
 
 BASE_FLAGS = ["-std=c++17", "-O2", "-pipe"]
 SANITIZE_FLAGS = ["-std=c++17", "-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
 
+_app: modal.App | None = None
+
+
+async def _create_sandbox(timeout: int) -> ModalSandbox:
+    global _app
+    if _app is None:  # one lookup per process (avoids Modal's app-create rate limit)
+        _app = await modal.App.lookup.aio(APP_NAME, create_if_missing=True)
+    sb = await modal.Sandbox.create.aio(
+        app=_app,
+        image=CPP_IMAGE,
+        timeout=timeout,
+        cpu=SANDBOX_CPU,
+        memory=SANDBOX_MEMORY_MB,
+        volumes={TESTS_MOUNT: TESTS_VOLUME},
+    )
+    return ModalSandbox(timeout=timeout, image=CPP_IMAGE, app=_app, sandbox=sb)
+
+
+class _ResourcedPool(ModalSandboxPool):
+    """Cookbook warm pool, but with fixed CPU/memory and the tests volume mounted."""
+
+    async def _create(self) -> ModalSandbox:
+        return await _create_sandbox(self._sandbox_timeout_secs)
+
+
+class OnDemandPool:
+    """Creates one sandbox per call, nothing idles. Best for evals, where sampling
+    dominates wall-clock and a warm pool would sit billing (and its sandboxes expire)."""
+
+    def __init__(self, max_concurrent: int = 32, creation_rate: float = 4.0):
+        self._sem = asyncio.Semaphore(max_concurrent)
+        self._interval = 1.0 / creation_rate
+        self._lock = asyncio.Lock()
+        self._next = 0.0
+
+    async def _throttle(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            if self._next > now:
+                await asyncio.sleep(self._next - now)
+            self._next = max(now, self._next) + self._interval
+
+    async def run_in_workdir(self, files: dict[str, str], command: list[str], timeout: int | None = None):
+        timeout = timeout or 600
+        async with self._sem:
+            await self._throttle()
+            sb = await _create_sandbox(timeout + 300)  # headroom for file writes
+            try:
+                workdir = "/workspace/run"
+                await sb.run_command(f"mkdir -p {workdir}")
+                writes = await asyncio.gather(*(sb.write_file(f"{workdir}/{n}", c) for n, c in files.items()))
+                bad = next((w for w in writes if w.exit_code != 0), None)
+                if bad is not None:
+                    return SandboxResult(stdout="", stderr=f"write failed: {bad.stderr}", exit_code=-1)
+                return await sb.run_command(shlex.join(command), workdir=workdir, timeout=timeout)
+            finally:
+                with contextlib.suppress(Exception):
+                    await sb.cleanup()
+
+    async def terminate(self) -> None:
+        pass
+
 
 def make_pool(pool_size: int = 16, sandbox_timeout_secs: int = 600) -> ModalSandboxPool:
-    """Must be called inside a running event loop. Each sandbox is used once then recycled."""
-    return ModalSandboxPool(
-        pool_size=pool_size,
-        sandbox_timeout_secs=sandbox_timeout_secs,
-        image=CPP_IMAGE,
-        app_name=APP_NAME,
-    )
+    """Warm pool (low latency, for RL). Must be called inside a running event loop."""
+    return _ResourcedPool(pool_size=pool_size, sandbox_timeout_secs=sandbox_timeout_secs, app_name=APP_NAME)
+
+
+def make_ondemand_pool(max_concurrent: int = 32) -> OnDemandPool:
+    return OnDemandPool(max_concurrent=max_concurrent)
 
 
 # ---------------------------------------------------------------- extraction
@@ -64,6 +130,21 @@ def extract_cpp(text: str) -> str | None:
     return None
 
 
+_PY_FENCE = re.compile(r"```[ \t]*(python|py|python3)?[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def extract_python(text: str) -> str | None:
+    """Last ```python block; falls back to an untagged fence that isn't obviously C++."""
+    blocks = _PY_FENCE.findall(text)
+    tagged = [code for tag, code in blocks if tag]
+    if tagged:
+        return tagged[-1]
+    for _, code in reversed(blocks):
+        if "#include" not in code:
+            return code
+    return None
+
+
 # ---------------------------------------------------------------- classification
 
 _COMPILE_RULES: list[tuple[str, re.Pattern[str]]] = [
@@ -73,7 +154,8 @@ _COMPILE_RULES: list[tuple[str, re.Pattern[str]]] = [
                               r"is not a member of|does not name a type|use of undeclared")),
     ("type_error", re.compile(r"no matching function|cannot convert|invalid conversion|no match for|"
                               r"invalid operands|cannot bind|conversion from .* to non-scalar|"
-                              r"template argument deduction/substitution failed|incomplete type")),
+                              r"template argument deduction/substitution failed|incomplete type|"
+                              r"inconsistent types .* deduced|cannot be used as a function")),
     ("syntax", re.compile(r"expected .* before|expected primary-expression|expected unqualified-id|"
                           r"stray '|missing terminating")),
 ]
@@ -91,7 +173,13 @@ def classify_compile(stderr: str) -> str:
     return "other"
 
 
-def classify_runtime(rc: int, stderr: str) -> str:
+def classify_runtime(rc: int, stderr: str, lang: str = "cpp") -> str:
+    if lang == "python":
+        # Last "SomeError: msg" line of the traceback -> "IndexError", "RecursionError", ...
+        m = re.findall(r"^(\w+(?:Error|Exception|Exit|Interrupt))\b", stderr, re.MULTILINE)
+        if m:
+            return m[-1]
+        return "killed" if rc < 0 else "nonzero_exit"
     if "AddressSanitizer" in stderr:
         if re.search(r"(heap|stack|global)-buffer-overflow|out of bounds", stderr):
             return "asan_oob"
@@ -127,10 +215,13 @@ class GradeResult:
 
 
 async def grade(
-    pool: ModalSandboxPool,
+    pool: ModalSandboxPool | OnDemandPool,
     model_output: str,
-    tests: list[dict[str, str]],
+    tests: list[dict[str, str]] | None = None,
     *,
+    tests_file: str | None = None,
+    n_tests: int | None = None,
+    retries: int = 2,
     code: str | None = None,
     time_limit: float = 2.0,
     memory_mb: int = 1024,
@@ -138,18 +229,33 @@ async def grade(
     float_tol: float = 1e-6,
     stop_on_first_failure: bool = True,
     compile_timeout: int = 60,
+    lang: str = "cpp",
 ) -> GradeResult:
     """Grade one completion. Pass `code` to skip extraction (e.g. reference solutions).
 
+    lang="python" runs the same tests with python3 (SyntaxError -> compile_error/syntax,
+    runtime subtype = exception name), so C++ and Python results are directly comparable.
+
     sanitize=True compiles with ASan/UBSan so out-of-bounds shows up as `asan_oob` instead of
-    a silent wrong answer. Slower (~2-3x); use it for diagnosis, not RL reward.
+    a silent wrong answer. Slower (~2-3x); use it for diagnosis, not RL reward. C++ only.
+
+    Tests come either inline (`tests`, uploaded with each call) or from the tests volume
+    (`tests_file` = path relative to the volume root, gzipped JSON; pass `n_tests` too).
+    Use the volume for big test sets so they aren't re-uploaded per sample.
     """
+    if lang not in ("cpp", "python"):
+        raise ValueError(f"lang must be 'cpp' or 'python', got {lang!r}")
+    if (tests is None) == (tests_file is None):
+        raise ValueError("pass exactly one of tests / tests_file")
+    total = len(tests) if tests is not None else (n_tests or 0)
+    sanitize = sanitize and lang == "cpp"
     if code is None:
-        code = extract_cpp(model_output)
+        code = extract_cpp(model_output) if lang == "cpp" else extract_python(model_output)
     if code is None:
-        return GradeResult("format_error", total=len(tests))
+        return GradeResult("format_error", total=total)
 
     cfg = {
+        "lang": lang,
         "compile_flags": SANITIZE_FLAGS if sanitize else BASE_FLAGS,
         "compile_timeout": compile_timeout,
         "time_limit": time_limit * (3 if sanitize else 1),
@@ -157,37 +263,50 @@ async def grade(
         "sanitize": sanitize,
         "float_tol": float_tol,
         "stop_on_first_failure": stop_on_first_failure,
+        "tests_file": f"{TESTS_MOUNT}/{tests_file}" if tests_file else None,
     }
     files = {
-        "sol.cpp": code,
-        "tests.json": json.dumps(tests),
+        ("sol.cpp" if lang == "cpp" else "sol.py"): code,
         "config.json": json.dumps(cfg),
         "runner.py": RUNNER_SRC,
     }
-    budget = compile_timeout + int(cfg["time_limit"] * len(tests)) + 30
-    res = await pool.run_in_workdir(files, ["python3", "runner.py", "config.json"], timeout=budget)
+    if tests is not None:
+        files["tests.json"] = json.dumps(tests)
+    budget = compile_timeout + int(cfg["time_limit"] * max(total, 1)) + 60
 
-    try:
-        out = json.loads(res.stdout.strip().splitlines()[-1])
-    except (IndexError, json.JSONDecodeError):
-        return GradeResult("infra_error", total=len(tests), code=code,
-                           detail=f"exit={res.exit_code} stderr={res.stderr[-1000:]}")
+    out, last_err = None, ""
+    for attempt in range(retries + 1):
+        try:
+            res = await pool.run_in_workdir(files, ["python3", "runner.py", "config.json"], timeout=budget)
+            out = json.loads(res.stdout.strip().splitlines()[-1])
+            break
+        except (IndexError, json.JSONDecodeError):
+            last_err = f"exit={res.exit_code} stderr={res.stderr[-1000:]}"
+        except Exception as e:  # sandbox died / Modal hiccup: retry on a fresh sandbox
+            last_err = f"{type(e).__name__}: {e}"
+        logger.warning("grade attempt %d failed: %s", attempt + 1, last_err[:200])
+    if out is None:
+        return GradeResult("infra_error", total=total, code=code, detail=last_err)
 
+    total = out.get("n_tests", total)
     if not out["compiled"]:
         err = out["compile_stderr"]
-        sub = "timeout" if err == "COMPILE_TIMEOUT" else classify_compile(err)
-        return GradeResult("compile_error", sub, total=len(tests), code=code, detail=err[:3000])
+        if err == "COMPILE_TIMEOUT":
+            sub = "timeout"
+        else:
+            sub = classify_compile(err) if lang == "cpp" else "syntax"
+        return GradeResult("compile_error", sub, total=total, code=code, detail=err[:3000])
 
     results = out["results"]
     passed = sum(r["status"] == "ok" for r in results)
     fail = next((r for r in results if r["status"] != "ok"), None)
     if fail is None:
-        return GradeResult("accepted", passed=passed, total=len(tests), code=code)
+        return GradeResult("accepted", passed=passed, total=total, code=code)
 
     if fail["status"] == "runtime_error":
-        return GradeResult("runtime_error", classify_runtime(fail["rc"], fail["stderr"]), passed,
-                           len(tests), detail=fail["stderr"][-1500:], code=code, extra={"test": fail["idx"]})
+        return GradeResult("runtime_error", classify_runtime(fail["rc"], fail["stderr"], lang), passed,
+                           total, detail=fail["stderr"][-1500:], code=code, extra={"test": fail["idx"]})
     if fail["status"] == "time_limit":
-        return GradeResult("time_limit", None, passed, len(tests), code=code, extra={"test": fail["idx"]})
-    return GradeResult("wrong_answer", None, passed, len(tests), code=code,
+        return GradeResult("time_limit", None, passed, total, code=code, extra={"test": fail["idx"]})
+    return GradeResult("wrong_answer", None, passed, total, code=code,
                        detail=f"got={fail['got']!r}\nwant={fail['want']!r}", extra={"test": fail["idx"]})
