@@ -130,6 +130,18 @@ def main(argv: list[str] | None = None):
     ap.add_argument("--malformed-penalty", type=float, default=0.05)
     ap.add_argument("--partial-credit", type=float, default=0.0,
                     help="weight of the above-trivial partial-credit bonus (posttrain/rl_env.py); 0 = off, try 0.15")
+    ap.add_argument("--history", nargs="*", default=[],
+                    help="earlier run names (under the runs dir): skip problems they found all-0 or all-100")
+    ap.add_argument("--history-skip", nargs="+", default=["too_easy", "too_hard"], choices=["too_easy", "too_hard"],
+                    help="history classes to skip (e.g. only too_easy when a longer token budget may crack too_hard ones)")
+    ap.add_argument("--hard-group-size", type=int, default=None, help="rollouts per task for hard problems")
+    ap.add_argument("--hard-min-rating", type=int, default=1900)
+    ap.add_argument("--harness", default="ours", choices=["ours", "vals"],
+                    help="vals: the competition harness's tools, prompt and no system prompt")
+    ap.add_argument("--reward-metric", default="groups", choices=["groups", "proportional"],
+                    help="proportional: per-test partial credit, as the competition grades")
+    ap.add_argument("--post-submit-penalty", type=float, default=0.0,
+                    help="per turn after the final graded submission (not counting a final EXIT), score > 0 only; try 0.05")
     ap.add_argument("--no-require-samples", action="store_true",
                     help="count the hidden-test score even if the graded submission fails a statement example")
     ap.add_argument("--max-trivial", type=float, default=0.5,
@@ -175,13 +187,18 @@ def main(argv: list[str] | None = None):
         max_tokens_per_turn=args.max_tokens, max_consecutive_parse_errors=args.max_parse_errors,
         turn_penalty=args.turn_penalty, malformed_penalty=args.malformed_penalty,
         partial_credit=args.partial_credit, max_trivial=args.max_trivial,
-        require_samples=not args.no_require_samples, log_path=log_path,
+        require_samples=not args.no_require_samples, post_submit_penalty=args.post_submit_penalty,
+        reward_metric=args.reward_metric, harness=args.harness,
+        history=tuple(str(RUNS_DIR / h / "rollouts.jsonl") for h in args.history), history_skip=tuple(args.history_skip),
+        hard_group_size=args.hard_group_size, hard_min_rating=args.hard_min_rating, log_path=log_path,
         pool_size=args.pool,
     )
 
     if args.dry_run:
         probs = builder.problems()
         n_batches = len(probs) // args.groups_per_batch
+        classes = builder.problem_classes()
+        sizes = [builder.group_size_for(p) for p in probs]
         rates = PUBLISHED_USD_PER_M.get(args.model)
         rollouts = args.groups_per_batch * args.group_size
         worst_tokens = rollouts * args.max_turns * args.max_tokens
@@ -191,6 +208,12 @@ def main(argv: list[str] | None = None):
             "ratings": dict(sorted(Counter((p.get("rating") or 0) // 200 * 200 for p in probs).items())),
             "batches_available": n_batches, "max_steps": args.max_steps,
             "rollouts_per_step": rollouts, "partial_credit": args.partial_credit,
+            "history": {"runs": args.history, "classes": dict(Counter(classes.values())),
+                        "in_pool": dict(Counter(classes.get(p["id"], "unseen") for p in probs))},
+            "group_sizes": dict(Counter(sizes)), "mean_rollouts_per_step": round(
+                args.groups_per_batch * sum(sizes) / max(1, len(sizes)), 1),
+            "post_submit_penalty": args.post_submit_penalty, "harness": args.harness,
+            "reward_metric": args.reward_metric,
             "async": args.max_steps_off_policy >= 0, "drop_constant_groups": not args.keep_constant_groups,
             "worst_case_generated_tokens_per_step": worst_tokens,
             "worst_case_usd_per_step_sample_plus_train": (round(worst_tokens / 1e6 * (rates["sample"] + rates["train"]), 2)
@@ -213,9 +236,13 @@ def main(argv: list[str] | None = None):
         from posttrain.evaluators import AgenticEvaluator
 
         # the cookbook wants builders (it calls each one to get the evaluator), not evaluators
+        import dataclasses as _dc
+
+        extra = {"harness": args.harness} if "harness" in {f.name for f in _dc.fields(AgenticEvaluator)} else {}
         evaluators.append(lambda: AgenticEvaluator(model_name=args.model, renderer_name=args.renderer,
                                                    limit=args.eval_agentic, max_turns=args.max_turns,
-                                                   max_tokens=args.max_tokens, context_window=args.context_window))
+                                                   max_tokens=args.max_tokens, context_window=args.context_window,
+                                                   **extra))
     cfg = Config(
         learning_rate=args.lr, dataset_builder=builder, model_name=args.model, recipe_name="vals_hacks_rl",
         renderer_name=args.renderer, lora_rank=args.lora_rank, max_tokens=args.max_tokens,

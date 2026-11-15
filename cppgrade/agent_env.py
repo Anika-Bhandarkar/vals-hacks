@@ -24,8 +24,8 @@ from tinker_cookbook.renderers.base import Message
 from tinker_cookbook.rl.rollout_limits import ParseErrorPolicy
 from tinker_cookbook.tool_use import build_agent_tool_env
 
-from cppgrade.agent_tasks import AgentTask, render_task, system_prompt
-from cppgrade.agent_tools import CompetitionTools
+from cppgrade.agent_tasks import AgentTask, render_task, render_task_vals, system_prompt
+from cppgrade.agent_tools import CompetitionTools, ValsCompetitionTools
 
 
 @dataclass
@@ -37,6 +37,7 @@ class EnvSettings:
     turn_penalty: float = 0.0            # RL only: ties go to fewer turns
     proportional: bool = False           # RL only: reward from proportional score
     parse_error_penalty: float = 0.05    # RL only: per malformed turn
+    harness: str = "ours"                # "vals": the competition harness's tools, prompt and no system prompt
 
 
 def _count_assistant_turns(history: list[Message]) -> int:
@@ -46,8 +47,14 @@ def _count_assistant_turns(history: list[Message]) -> int:
 def build_competition_env(task: AgentTask, renderer: Renderer, pool: Any, settings: EnvSettings | None = None):
     """Returns (env, tools). Keep `tools` to read submissions/score after the rollout."""
     s = settings or EnvSettings()
-    tools = CompetitionTools(task, pool)
-    tool_list = [tools.run_cpp, tools.submit]
+    if s.harness == "vals":
+        tools = ValsCompetitionTools(task, pool)
+        tool_list = [tools.cpp_executor, tools.submission]
+    elif s.harness == "ours":
+        tools = CompetitionTools(task, pool)
+        tool_list = [tools.run_cpp, tools.submit]
+    else:
+        raise ValueError(f"unknown harness {s.harness!r}")
 
     async def reward_fn(history: list[Message]) -> tuple[float, dict[str, float]]:
         res = await tools.final_score()
@@ -61,9 +68,10 @@ def build_competition_env(task: AgentTask, renderer: Renderer, pool: Any, settin
             "run_calls": float(tools.n_run_calls),
         }
 
+    vals = s.harness == "vals"
     initial = renderer.create_conversation_prefix_with_tools(
-        tools=[t.to_spec() for t in tool_list], system_prompt=system_prompt(task)
-    ) + [{"role": "user", "content": render_task(task)}]
+        tools=[t.to_spec() for t in tool_list], system_prompt="" if vals else system_prompt(task)
+    ) + [{"role": "user", "content": render_task_vals(task) if vals else render_task(task)}]
 
     env = build_agent_tool_env(
         renderer=renderer,

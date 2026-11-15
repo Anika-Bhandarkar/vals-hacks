@@ -7,7 +7,8 @@ One-time: a Modal Secret holding the Tinker key (only TINKER_API_KEY; nothing el
 
     modal secret create tinker-api TINKER_API_KEY=<your key>
 
-Start (all train_rl.py flags pass through; `--detach` keeps it running after the client exits):
+Start (all train_rl.py flags pass through; `--detach` keeps it running after the client exits;
+`--account personal` bills the second Tinker account, via the Modal Secret `tinker-api-personal`):
 
     uv run modal run --detach scripts/train_rl_modal.py --name rl-v1 --load-checkpoint tinker://.../weights/final
 
@@ -69,7 +70,25 @@ def _launch_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--summarize")
     ap.add_argument("--pull")
+    ap.add_argument("--account", default="main", choices=sorted(ACCOUNT_SECRETS))
     return ap.parse_known_args(argv)[0]
+
+
+# Which Tinker account pays: each is a Modal Secret holding only that account's TINKER_API_KEY.
+# Checkpoints belong to the account that trained them, so --load-checkpoint must be from the same one.
+ACCOUNT_SECRETS = {"main": "tinker-api", "personal": "tinker-api-personal"}
+
+
+def _without_account(argv: list[str]) -> list[str]:
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a == "--account":
+            skip = True
+        elif not a.startswith("--account="):
+            out.append(a)
+    return out
 
 
 def _without_if_exists(argv: list[str]) -> list[str]:
@@ -92,13 +111,7 @@ def _committer(stop: threading.Event, every_s: float = 30.0) -> None:
             print(f"[train_rl_modal] volume commit failed: {type(e).__name__}: {e}", flush=True)
 
 
-@app.function(
-    cpu=2.0, memory=4096, timeout=TIMEOUT_S,
-    retries=modal.Retries(max_retries=MAX_RETRIES, initial_delay=30.0, backoff_coefficient=2.0),
-    secrets=[modal.Secret.from_name("tinker-api")],
-    volumes={RUNS_MOUNT: RUNS_VOLUME},
-)
-def train(argv: list[str]) -> None:
+def _train(argv: list[str]) -> None:
     sys.path.insert(0, "/root/scripts")
     import train_rl
 
@@ -118,6 +131,21 @@ def train(argv: list[str]) -> None:
         RUNS_VOLUME.commit()
 
 
+_FN = dict(cpu=2.0, memory=4096, timeout=TIMEOUT_S,
+           retries=modal.Retries(max_retries=MAX_RETRIES, initial_delay=30.0, backoff_coefficient=2.0),
+           volumes={RUNS_MOUNT: RUNS_VOLUME})
+
+
+@app.function(secrets=[modal.Secret.from_name(ACCOUNT_SECRETS["main"])], **_FN)
+def train(argv: list[str]) -> None:
+    _train(argv)
+
+
+@app.function(secrets=[modal.Secret.from_name(ACCOUNT_SECRETS["personal"])], **_FN)
+def train_personal(argv: list[str]) -> None:
+    _train(argv)
+
+
 def _remote_exists(rel: str) -> bool:
     try:
         return bool(list(RUNS_VOLUME.iterdir(rel)))
@@ -127,8 +155,8 @@ def _remote_exists(rel: str) -> bool:
 
 @app.local_entrypoint()
 def main(*argv: str) -> None:
-    argv = list(argv)
-    a = _launch_args(argv)
+    a = _launch_args(list(argv))
+    argv = _without_account(list(argv))
     sys.path.insert(0, str(ROOT / "scripts"))
     import train_rl
 
@@ -154,7 +182,9 @@ def main(*argv: str) -> None:
           f"  stop:   uv run modal app stop -y {app.app_id}", flush=True)
     # spawn, not remote: a .remote() call is cancelled when the local client is killed, even with --detach.
     # A spawned call belongs to the detached app, which keeps running until the call finishes.
-    call = train.spawn(argv)
+    fn = {"main": train, "personal": train_personal}[a.account]
+    print(f"  tinker account: {a.account} (Modal secret {ACCOUNT_SECRETS[a.account]})", flush=True)
+    call = fn.spawn(argv)
     print(f"  call id: {call.object_id}\n"
           f"Launched; this terminal can close. When it's done (`modal app list` shows the app stopped):\n"
           f"  uv run modal run scripts/train_rl_modal.py --pull {a.name}", flush=True)

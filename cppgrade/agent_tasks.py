@@ -127,3 +127,33 @@ def task_from_codeforces(p: dict) -> AgentTask:
         tests_file=p["tests_file"], n_tests=p["n_tests"],
         time_limit_s=float(p["time_limit"]), memory_mb=max(256, int(p["memory_limit"])),
     )
+
+
+# ---------------------------------------------------------------- the competition harness's prompt
+# Verbatim from github.com/vals-ai/hackathon-post-training-agent (src/post_training_agent/utils.py).
+# The harness sends it as the only (user) message, with no system prompt besides the tool definitions.
+VALS_INSTRUCTIONS_PROMPT = """
+You will solve a competitive programming problem.
+
+Write your solution as a complete C++20 program that reads standard input and writes standard output. Enclose code in three backticks, for example:
+
+```
+[your code here]
+```
+
+You have two tools. cpp_executor compiles a program and runs it on stdin you choose, for experiments, brute forces and stress tests. submission saves a solution as your answer and runs it on the sample tests from the statement. Your last submission that compiles is graded on hidden tests, under the time limit, with partial credit for each test it passes.
+
+You may make at most 50 submissions in at most 100 turns. When you are done and do not want to submit again, respond with 'EXIT'.
+
+The problem statement follows:
+{question}
+"""
+
+
+def render_task_vals(task: AgentTask) -> str:
+    """The harness's user message: its instructions + the problem statement file (title, statement with
+    examples, limits)."""
+    question = f"{task.title}\n\n{task.statement}"
+    if "time limit" not in task.statement.lower():
+        question += f"\n\nLimits: {format_limits(task.time_limit_s, task.memory_mb)} per test."
+    return VALS_INSTRUCTIONS_PROMPT.format(question=question)
