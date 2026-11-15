@@ -24,6 +24,7 @@ import logging
 import re
 import shlex
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -417,9 +418,37 @@ class ScoreResult:
     compile_error: str = ""
     infra_error: str = ""
     per_test: list[tuple[int, str, str]] = field(default_factory=list)  # (input bytes, group, verdict)
+    # Trivial baseline per group: the largest fraction of its tests one constant-answer program passes
+    # (the same token printed for every case, e.g. "YES" / "0" / "-1"). See `partial_credit`.
+    trivial_small: float = 0.0
+    trivial_large: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _trivial_frac(results: list[dict[str, Any]], idxs: list[int]) -> float:
+    consts = Counter(results[i]["const"] for i in idxs if "const" in results[i])
+    return max(consts.values()) / len(idxs) if consts and idxs else 0.0
+
+
+def partial_credit(res: ScoreResult, max_trivial: float = 0.5) -> float:
+    """0-1 credit for passing tests beyond what the best constant-answer program passes, per group,
+    weighted 40/60 like the score: adj(f) = max(0, f - f_trivial) / (1 - f_trivial). A group whose
+    trivial baseline is above `max_trivial` gives nothing (too lopsided to measure partial progress).
+    Not the competition score: an RL shaping term only."""
+    if not res.compiled:
+        return 0.0
+
+    def adj(passed: int, total: int, trivial: float) -> float:
+        if not total or trivial > max_trivial:
+            return 0.0
+        return max(0.0, passed / total - trivial) / (1.0 - trivial)
+
+    s = adj(res.small_passed, res.small_total, res.trivial_small)
+    if not res.large_total:
+        return s
+    return 0.4 * s + 0.6 * adj(res.large_passed, res.large_total, res.trivial_large)
 
 
 def split_small_large(
@@ -456,7 +485,8 @@ async def score_submission(
     small_frac: float = 0.4,
 ) -> ScoreResult:
     """Run ALL hidden tests (no early stop, partial credit needs every verdict) and score 0-100."""
-    cfg = _base_cfg("tests", time_limit, memory_mb, cpp_std, tests_file=f"{TESTS_MOUNT}/{tests_file}")
+    cfg = _base_cfg("tests", time_limit, memory_mb, cpp_std, tests_file=f"{TESTS_MOUNT}/{tests_file}",
+                    report_const=True)
     budget = 60 + int(time_limit * max(1, n_tests)) + 90
     out, err = await _execute(pool, code, cfg, budget=budget)
     if out is None:
@@ -478,4 +508,6 @@ async def score_submission(
         statuses[_verdict(r)] = statuses.get(_verdict(r), 0) + 1
     small_set = set(small)
     per_test = [(r["in_bytes"], "small" if i in small_set else "large", _verdict(r)) for i, r in enumerate(results)]
-    return ScoreResult(True, score, round(prop, 2), sp, len(small), lp, len(large), statuses, per_test=per_test)
+    return ScoreResult(True, score, round(prop, 2), sp, len(small), lp, len(large), statuses, per_test=per_test,
+                       trivial_small=round(_trivial_frac(results, small), 4),
+                       trivial_large=round(_trivial_frac(results, large), 4))

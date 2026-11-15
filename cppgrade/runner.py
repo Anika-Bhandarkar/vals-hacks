@@ -9,6 +9,12 @@ sandbox stdout stream is capped at ~128KB.
 The program's stdout/stderr go to size-capped files (RLIMIT_FSIZE), never into this process's
 memory: a wrong solution that prints in a loop until the time limit used to OOM the sandbox.
 
+Jail (C++, on by default): the sandbox mounts the tests volume (hidden tests for every problem) at
+/data, readable by anything that runs here. So the solution is linked statically and run chrooted into
+an empty directory as uid/gid 65534: it sees only itself, and stdin/stdout/stderr are file descriptors
+opened before the chroot. Matters for RL, where a policy could otherwise learn to print answers it read
+from the volume. Off for Python (needs the interpreter) and ASan builds (no static sanitizers).
+
 Stdlib only, so the sandbox image stays tiny.
 Usage: python3 runner.py config.json
 """
@@ -17,6 +23,7 @@ import gzip
 import json
 import os
 import resource
+import shutil
 import signal
 import subprocess
 import sys
@@ -26,21 +33,31 @@ SNIP = 400  # chars of stdout/stderr kept per failing test, for debugging
 OUTPUT_LIMIT_RCS = (-signal.SIGXFSZ, 128 + signal.SIGXFSZ)
 
 
-def _preexec(memory_mb: int | None, out_cap: int):
+JAIL_DIR = "jail"
+NOBODY = 65534
+
+
+def _preexec(memory_mb: int | None, out_cap: int, jail: str | None = None):
     def fn():
         if memory_mb:
             b = memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (b, b))
         resource.setrlimit(resource.RLIMIT_FSIZE, (out_cap, out_cap))
+        if jail:
+            os.chroot(jail)
+            os.chdir("/")
+            os.setgroups([])
+            os.setgid(NOBODY)
+            os.setuid(NOBODY)
 
     return fn
 
 
-def _run_once(cmd, stdin_path, time_limit, memory_mb, out_cap):
+def _run_once(cmd, stdin_path, time_limit, memory_mb, out_cap, jail=None):
     """Returns (rc or None if timed out, elapsed, stdout_text, stderr_text)."""
     with open(stdin_path, "rb") as fin, open("out.txt", "wb") as fout, open("err.txt", "wb") as ferr:
         start = time.time()
-        p = subprocess.Popen(cmd, stdin=fin, stdout=fout, stderr=ferr, preexec_fn=_preexec(memory_mb, out_cap))
+        p = subprocess.Popen(cmd, stdin=fin, stdout=fout, stderr=ferr, preexec_fn=_preexec(memory_mb, out_cap, jail))
         try:
             rc = p.wait(timeout=time_limit)
         except subprocess.TimeoutExpired:
@@ -97,6 +114,11 @@ def main():
     else:
         build = ["g++", *cfg["compile_flags"], "-o", "sol", "sol.cpp"]
         run_cmd = ["./sol"]
+    # chroot needs root (always true in our Modal sandboxes); anywhere else it runs unjailed
+    jail = (os.path.abspath(JAIL_DIR) if lang == "cpp" and not cfg["sanitize"] and cfg.get("jail", True)
+            and os.geteuid() == 0 else None)
+    if jail:
+        build.insert(1, "-static")  # g++ -static ...: no libraries needed inside the jail
 
     t0 = time.time()
     try:
@@ -108,16 +130,22 @@ def main():
     if c.returncode != 0:
         print(json.dumps({"compiled": False, "n_tests": len(tests), "compile_stderr": c.stderr[-8000:], "compile_s": compile_s}))
         return
+    if jail:
+        os.makedirs(jail, exist_ok=True)
+        os.chmod(jail, 0o755)
+        shutil.copy("sol", os.path.join(jail, "sol"))
+        os.chmod(os.path.join(jail, "sol"), 0o755)
+        run_cmd = ["/sol"]  # resolved inside the jail, after the chroot
 
     if mode == "run":
         cap = cfg.get("run_output_chars", 4000)
-        rc, elapsed, out, err = _run_once(run_cmd, "run_input.txt", cfg["time_limit"], mem, out_cap)
+        rc, elapsed, out, err = _run_once(run_cmd, "run_input.txt", cfg["time_limit"], mem, out_cap, jail)
         print(json.dumps({
             "compiled": True, "compile_stderr": c.stderr[-2000:], "compile_s": compile_s,
             "timed_out": rc is None, "exit_code": rc, "time_s": round(elapsed, 3),
             "output_limit": rc in OUTPUT_LIMIT_RCS,
             "stdout": out[:cap], "stdout_truncated": len(out) > cap,
-            "stderr": err[-cap // 2:],
+            "stderr": err[-cap // 2:], "jailed": bool(jail),
         }))
         return
 
@@ -125,7 +153,7 @@ def main():
     for i, t in enumerate(tests):
         with open("in.txt", "w") as f:
             f.write(t["input"])
-        rc, elapsed, out, err = _run_once(run_cmd, "in.txt", cfg["time_limit"], mem, out_cap)
+        rc, elapsed, out, err = _run_once(run_cmd, "in.txt", cfg["time_limit"], mem, out_cap, jail)
         rec = {"idx": i, "in_bytes": len(t["input"])}
         if rc is None:
             rec.update(status="time_limit")
@@ -138,6 +166,12 @@ def main():
         else:
             rec.update(status="wrong_answer", got=out[:SNIP], want=t["output"][:SNIP])
         rec["elapsed"] = round(elapsed, 3)
+        if cfg.get("report_const"):
+            # The expected output is one token repeated ("YES" per test case, a single "-1", ...): a program
+            # that prints that constant for every case passes this test. Used for the trivial baseline.
+            toks = t["output"].split()
+            if toks and len(toks[0]) <= 32 and toks.count(toks[0]) == len(toks):
+                rec["const"] = toks[0]
         if rec["status"] != "ok" and cfg.get("report_input_chars"):
             rec["input_head"] = t["input"][: cfg["report_input_chars"]]
             rec["want_head"] = t["output"][: cfg["report_input_chars"]]
@@ -145,7 +179,8 @@ def main():
         if cfg["stop_on_first_failure"] and rec["status"] != "ok":
             break
 
-    print(json.dumps({"compiled": True, "n_tests": len(tests), "compile_s": compile_s, "results": results}))
+    print(json.dumps({"compiled": True, "n_tests": len(tests), "compile_s": compile_s, "results": results,
+                      "jailed": bool(jail)}))
 
 
 if __name__ == "__main__":
