@@ -214,6 +214,13 @@ async def run(args) -> Path | None:
             "final_code": tools.last_compiling.code if tools.last_compiling else None,
             "transcript": history, **tools.stats(),
         }
+        if traj.stop_reason == "max_tokens" and traj.transitions:
+            # The cut-off turn never reaches the env's history: keep its end, to tell looping from long reasoning.
+            text = renderer.tokenizer.decode(traj.transitions[-1].ac.tokens)
+            tail = text[-6000:]
+            chunks = [tail[i:i + 150] for i in range(0, len(tail) - 150, 150)]
+            rec["truncated_turn"] = {"chars": len(text), "tail": tail,
+                                     "repeated_chunk_frac": round(1 - len(set(chunks)) / max(1, len(chunks)), 2)}
         async with lock:
             with open(results_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
