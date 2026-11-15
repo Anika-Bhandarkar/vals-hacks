@@ -44,11 +44,23 @@ def _safe_id(pid: str) -> str:
     return pid.replace("/", "_")
 
 
+# Prep runs in three steps so a big pool doesn't hit one function's timeout, and a re-run resumes:
+#   1. _select_remote:  read problem metadata, pick problems, stage them per contest on the volume
+#   2. _contest_remote: one call per contest, in parallel: download its generated tests, write the
+#                       per-problem test files, record a done-marker (skipped on re-run)
+#   3. _finalize_remote: write index.json from the done-markers of the picked contests
+PREP_PARALLEL = 16  # concurrent contest workers (each downloads one contest's test parquet from HF)
+
+
+def _staging(split: str) -> str:
+    return f"{TESTS_MOUNT}/{vol_dir(split)}/_staging"
+
+
 @prep_app.function(image=prep_image, volumes={TESTS_MOUNT: TESTS_VOLUME}, timeout=3600, cpu=2, memory=16384)
-def prepare_remote(split: str, min_rating: int, max_rating: int, require_editorial: bool, max_problems: int | None) -> dict:
+def _select_remote(split: str, min_rating: int, max_rating: int, require_editorial: bool,
+                   max_problems: int | None) -> list[str]:
     import os
 
-    import pyarrow.compute as pc
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download, list_repo_files
 
@@ -68,57 +80,106 @@ def prepare_remote(split: str, min_rating: int, max_rating: int, require_editori
     picked = rows[:max_problems] if max_problems else rows
     by_contest: dict[str, list[dict]] = {}
     for r in picked:
-        by_contest.setdefault(r["contest_id"], []).append(r)
+        by_contest.setdefault(str(r["contest_id"]), []).append(r)
 
-    out_dir = f"{TESTS_MOUNT}/{vol_dir(split)}"
-    os.makedirs(out_dir, exist_ok=True)
-    index, stats = [], {"picked": len(picked), "no_tests": 0, "editorial_has_code": 0}
-    for cid, probs in sorted(by_contest.items()):
-        gen: dict[str, list[dict]] = {}
+    stage = _staging(split)
+    os.makedirs(stage, exist_ok=True)
+    has_gen = {cid: f"generated_tests/test_cases_{int(cid):04d}.parquet" in files for cid in by_contest}
+    for cid, probs in by_contest.items():
+        with gzip.open(f"{stage}/{cid}.json.gz", "wt") as g:
+            json.dump({"has_generated": has_gen[cid], "problems": probs}, g)
+    TESTS_VOLUME.commit()
+    return sorted(by_contest)
+
+
+@prep_app.function(image=prep_image, volumes={TESTS_MOUNT: TESTS_VOLUME}, timeout=3600, cpu=2, memory=16384,
+                   max_containers=PREP_PARALLEL, retries=2)
+def _contest_remote(split: str, cid: str) -> list[dict]:
+    import os
+
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+
+    TESTS_VOLUME.reload()
+    done_path = f"{_staging(split)}/{cid}.done.json"
+    with gzip.open(f"{_staging(split)}/{cid}.json.gz", "rt") as g:
+        staged = json.load(g)
+    ids = sorted(p["id"] for p in staged["problems"])
+    if os.path.exists(done_path):
+        prev = json.load(open(done_path))
+        if prev.get("ids") == ids:  # same selection as last time: nothing to redo
+            return prev["entries"]
+
+    gen: dict[str, list[dict]] = {}
+    if staged["has_generated"]:
         fname = f"generated_tests/test_cases_{int(cid):04d}.parquet"
-        if fname in files:
-            ids = [p["id"] for p in probs]
-            t = pq.read_table(hf_hub_download(HF_REPO, fname, repo_type="dataset"),
-                              columns=["problem_id", "input", "output"], filters=[("problem_id", "in", ids)])
-            for row in t.to_pylist():
-                gen.setdefault(row["problem_id"], []).append({"input": row["input"], "output": row["output"]})
-        for p in probs:
-            seen, tests = set(), []
-            for tc in (p["official_tests"] or []) + gen.get(p["id"], []):
-                if tc["input"] in seen:
-                    continue
-                seen.add(tc["input"])
-                tests.append({"input": tc["input"], "output": tc["output"]})
-            if not tests:
-                stats["no_tests"] += 1
+        t = pq.read_table(hf_hub_download(HF_REPO, fname, repo_type="dataset"),
+                          columns=["problem_id", "input", "output"], filters=[("problem_id", "in", ids)])
+        for row in t.to_pylist():
+            gen.setdefault(row["problem_id"], []).append({"input": row["input"], "output": row["output"]})
+    entries = []
+    for p in staged["problems"]:
+        seen, tests = set(), []
+        for tc in (p["official_tests"] or []) + gen.get(p["id"], []):
+            if tc["input"] in seen:
                 continue
-            rel = f"{vol_dir(split)}/{_safe_id(p['id'])}.json.gz"
-            with gzip.open(f"{TESTS_MOUNT}/{rel}", "wt") as g:
-                json.dump(tests, g)
-            ed = p["editorial"] or ""
-            if re.search(r"#include|int main\s*\(|\bcin\s*>>|\bprintf\s*\(", ed):
-                stats["editorial_has_code"] += 1
-            index.append({
-                "id": p["id"], "contest_id": p["contest_id"], "contest_start": p["contest_start"],
-                "rating": p["rating"], "tags": list(p["tags"] or []), "title": p["title"],
-                "description": p["description"], "input_format": p["input_format"],
-                "output_format": p["output_format"], "note": p["note"],
-                "examples": [{"input": e["input"], "output": e["output"]} for e in (p["examples"] or [])],
-                "editorial": ed, "time_limit": p["time_limit"], "memory_limit": p["memory_limit"],
-                "n_tests": len(tests), "tests_file": rel,
-            })
-    with open(f"{out_dir}/index.json", "w") as f:
+            seen.add(tc["input"])
+            tests.append({"input": tc["input"], "output": tc["output"]})
+        if not tests:
+            entries.append({"id": p["id"], "no_tests": True})
+            continue
+        rel = f"{vol_dir(split)}/{_safe_id(p['id'])}.json.gz"
+        with gzip.open(f"{TESTS_MOUNT}/{rel}", "wt") as g:
+            json.dump(tests, g)
+        entries.append({
+            "id": p["id"], "contest_id": p["contest_id"], "contest_start": p["contest_start"],
+            "rating": p["rating"], "tags": list(p["tags"] or []), "title": p["title"],
+            "description": p["description"], "input_format": p["input_format"],
+            "output_format": p["output_format"], "note": p["note"],
+            "examples": [{"input": e["input"], "output": e["output"]} for e in (p["examples"] or [])],
+            "editorial": p["editorial"] or "", "time_limit": p["time_limit"], "memory_limit": p["memory_limit"],
+            "n_tests": len(tests), "tests_file": rel,
+        })
+    with open(done_path, "w") as f:
+        json.dump({"ids": ids, "entries": entries}, f)
+    TESTS_VOLUME.commit()
+    return entries
+
+
+@prep_app.function(image=prep_image, volumes={TESTS_MOUNT: TESTS_VOLUME}, timeout=600)
+def _finalize_remote(split: str, index: list[dict]) -> None:
+    with open(f"{TESTS_MOUNT}/{vol_dir(split)}/index.json", "w") as f:
         json.dump(index, f)
     TESTS_VOLUME.commit()
-    stats["written"] = len(index)
-    stats["tests_per_problem_median"] = sorted(p["n_tests"] for p in index)[len(index) // 2] if index else 0
-    return stats
 
 
 def prepare(split: str = "test", min_rating: int = 1600, max_rating: int = 2400,
             require_editorial: bool = True, max_problems: int | None = None) -> dict:
+    """Safe to re-run: contests already written with the same problems are skipped."""
     with modal.enable_output(), prep_app.run():
-        return prepare_remote.remote(split, min_rating, max_rating, require_editorial, max_problems)
+        cids = _select_remote.remote(split, min_rating, max_rating, require_editorial, max_problems)
+        print(f"{len(cids)} contests to prepare ({PREP_PARALLEL} at a time)", flush=True)
+        index, failed, no_tests = [], [], 0
+        # list() drains the map inside the app context (a half-consumed generator errors on shutdown)
+        results = list(_contest_remote.map([split] * len(cids), cids, return_exceptions=True))
+        for i, (cid, res) in enumerate(zip(cids, results)):
+            if isinstance(res, BaseException):
+                failed.append(cid)
+                print(f"  ! contest {cid}: {type(res).__name__}: {str(res)[:200]}", flush=True)
+                continue
+            no_tests += sum(1 for e in res if e.get("no_tests"))
+            index += [e for e in res if not e.get("no_tests")]
+            if (i + 1) % 25 == 0 or i + 1 == len(cids):
+                print(f"  [{i + 1}/{len(cids)} contests] {len(index)} problems written", flush=True)
+        index.sort(key=lambda e: (-(e["contest_start"] or 0), e["id"]))
+        _finalize_remote.remote(split, index)
+    ed_code = sum(bool(re.search(r"#include|int main\s*\(|\bcin\s*>>|\bprintf\s*\(", e["editorial"])) for e in index)
+    stats = {"contests": len(cids), "failed_contests": len(failed), "written": len(index), "no_tests": no_tests,
+             "with_editorial": sum(bool(e["editorial"].strip()) for e in index), "editorial_has_code": ed_code,
+             "tests_per_problem_median": sorted(e["n_tests"] for e in index)[len(index) // 2] if index else 0}
+    if failed:
+        print(f"{len(failed)} contests failed (index written without them): re-run the same command to retry.")
+    return stats
 
 
 def load_index(split: str = "test", refresh: bool = False) -> list[dict]:
