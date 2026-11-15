@@ -69,6 +69,37 @@ uv run python scripts/eval_lcb.py --summarize runs/evals/qwen3-8b
   - `make_pool()` keeps a warm pool, for low latency in RL. Set its size with `MODAL_POOL_SIZE`.
 - Tests are passed either inline (`tests=[...]`) or as a file on the Volume (`tests_file=..., n_tests=...`).
 
+## SFT (`posttrain/`, `scripts/build_sft_data.py`, `scripts/train_sft.py`)
+
+Every SFT source writes one JSONL format (`posttrain/sft_data.py`). Every example is checked against the hidden-test grader, and eval problems are removed (`posttrain/decontam.py`: ID blocklist plus overlap with eval statements).
+
+```bash
+# 1. training problem pool on the Modal Volume (once): Codeforces train split, newest first
+uv run python scripts/prepare_codeforces.py --split train --min-rating 1200 --max-rating 2600 --no-require-editorial --max-problems 2000
+
+# 2. data: pick any of these
+uv run python scripts/build_sft_data.py rft-single  --out data/sft/rft_single.jsonl  --pool-limit 500 --samples 4   # own shortest correct answers
+uv run python scripts/build_sft_data.py rft-agentic --out data/sft/rft_agentic.jsonl --pool-limit 300 --samples 2   # own best competition sessions
+uv run python scripts/build_sft_data.py traces --out data/sft/r1_cots.jsonl --hf open-r1/codeforces-cots           # teacher traces, correct ones only
+uv run python scripts/build_sft_data.py traces --out data/sft/teacher.jsonl --file generations.jsonl               # any {"problem_id","response"} file
+uv run python scripts/build_sft_data.py mix --out data/sft/mix.jsonl --inputs data/sft/rft_agentic.jsonl data/sft/r1_cots.jsonl:3000
+uv run python scripts/build_sft_data.py stats data/sft/mix.jsonl                                                    # offline: examples, tokens, too-long
+
+# 3. train (LoRA on Tinker); --dry-run checks data and config without calling Tinker
+uv run python scripts/train_sft.py --name sft-v1 --data data/sft/mix.jsonl --dry-run
+uv run python scripts/train_sft.py --name sft-v1 --data data/sft/mix.jsonl --save-every 25 --eval-agentic 20 --eval-every 50
+
+# 4. evaluate the final checkpoint with the full evals (the command is printed at the end of training)
+uv run python scripts/eval_agentic.py --model Qwen/Qwen3-8B --model-path tinker://.../sampler_weights/final --limit 50 --name agent-sft-v1
+```
+
+- **Multi-turn sessions** become one training example per assistant turn. Each example's context drops earlier thinking, so it matches the prompt the model sees at inference with Qwen3's template, token for token.
+- **Session filter** (`rft-agentic`): score 100, at most 8 turns, no identical resubmits, no malformed calls, no regression, ends with `EXIT`. Each threshold is a flag.
+- **Too-long examples are dropped, not truncated.** Truncating would cut off the final code.
+- `rft-single` also writes `<out>.pass_rates.json`. Problems with a pass rate strictly between 0 and 1 are the ones RL learns from.
+- **In-training evals** (`--eval-single N`, `--eval-agentic N`) run on the first N held-out LiveCodeBench problems, the same subset the eval scripts use. Keep N small; the eval scripts are the source of truth.
+- **Checkpoints and metrics:** `runs/train/<name>/checkpoints.jsonl` and `metrics.jsonl`. Periodic checkpoints expire after `--ttl-days`; the final one is kept.
+
 ## Reference
 
 - RL recipe to adapt: `tinker_cookbook/recipes/code_rl/` (DeepCoder-style, Python-graded; swap in `cppgrade.grade` for the reward).

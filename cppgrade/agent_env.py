@@ -24,7 +24,7 @@ from tinker_cookbook.renderers.base import Message
 from tinker_cookbook.rl.rollout_limits import ParseErrorPolicy
 from tinker_cookbook.tool_use import build_agent_tool_env
 
-from cppgrade.agent_tasks import SYSTEM_PROMPT, AgentTask, render_task
+from cppgrade.agent_tasks import AgentTask, render_task, system_prompt
 from cppgrade.agent_tools import CompetitionTools
 
 
@@ -62,7 +62,7 @@ def build_competition_env(task: AgentTask, renderer: Renderer, pool: Any, settin
         }
 
     initial = renderer.create_conversation_prefix_with_tools(
-        tools=[t.to_spec() for t in tool_list], system_prompt=SYSTEM_PROMPT
+        tools=[t.to_spec() for t in tool_list], system_prompt=system_prompt(task)
     ) + [{"role": "user", "content": render_task(task)}]
 
     env = build_agent_tool_env(
