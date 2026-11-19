@@ -1,6 +1,6 @@
 # C++ post-training workspace
 
-- I was able to improve Qwen3.5-9B by 52 percentage points if partial credit on the LiveCodeBench benchmark adapted for agentic use with supported tool-calling capabilities. Pass@1 went from 11% to 53%. RL setup included a multi-turn agentic environment with outcome rewards. Rewards tested output code on a hidden test suite. 
+- I was able to improve Qwen3.5-9B by 52 percentage points of partial credit on the LiveCodeBench benchmark adapted for agentic use with supported tool-calling capabilities. Pass@1 went from 11% to 53%. RL setup included a multi-turn agentic environment with outcome rewards. Rewards tested output code on a hidden test suite. 
 - More broadly, this repo includes eval code in agentic and non-agentic environments, C++ vs. Python comparisons to isolate C++ capabilities from general coding reasoning capabilities, custom RL environment setup mimicking the competition harness, and functionality to post-train using SFT, RL, or distillation.  
 
 ## What this repo does
