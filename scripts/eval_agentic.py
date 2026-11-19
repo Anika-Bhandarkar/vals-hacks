@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from collections import Counter, defaultdict
@@ -146,7 +147,7 @@ async def run(args) -> Path | None:
     from cppgrade.agent_tasks import load_agent_tasks
     from cppgrade.grader import make_ondemand_pool
 
-    out_dir = ROOT / "runs" / "evals" / args.name
+    out_dir = Path(os.environ.get("VALS_EVALS_DIR", ROOT / "runs" / "evals")) / args.name  # Modal: the runs volume
     results_path = out_dir / "results.jsonl"
     cfg = {k: (list(v) if isinstance(v, tuple) else v) for k, v in vars(args).items() if k not in ("summarize", "show", "dry_run")}
     cfg_path = out_dir / "config.json"
@@ -278,7 +279,8 @@ def main():
     out_dir = asyncio.run(run(args))
     if out_dir is not None:
         print_summary(summarize(out_dir))
-        print(f"\nWrote {out_dir.relative_to(ROOT)}/{{results.jsonl,summary.json}}")
+        shown = out_dir.relative_to(ROOT) if out_dir.is_relative_to(ROOT) else out_dir
+        print(f"\nWrote {shown}/{{results.jsonl,summary.json}}")
 
 
 if __name__ == "__main__":
